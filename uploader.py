@@ -1,14 +1,12 @@
 """Append the local buffer to the private GitHub data repository.
 
-Publishing is strictly append-only. Buffered CSV rows are merged into the
-remote copy keyed on message id, a single commit is made, and no path is ever
-deleted. An empty local buffer therefore cannot damage the archive, which is
-what lets the bot treat its local tree as disposable staging.
+Publishing is strictly append-only: rows are merged into the remote copy keyed
+on message id, one commit is made, and no path is ever deleted. An empty local
+buffer therefore cannot damage the archive.
 
-Each commit is assembled through the git data API: blobs, then a tree layered on
-the current remote tree, then a commit, then a ref update. Files whose git blob
-hash already matches the remote are skipped, so a steady-state sync costs two
-API calls regardless of archive size.
+Each commit goes through the git data API -- blobs, then a tree layered on the
+current remote tree, then a commit, then a ref update. Unchanged files are
+skipped, so a steady-state sync costs two calls regardless of archive size.
 
 Usable as a library from ``main.py`` or standalone::
 
@@ -125,10 +123,9 @@ class GitHubArchive:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            # aiohttp's default total timeout is 300s, which would let one hung
-            # request stall a publish cycle for five minutes with nothing logged.
-            # The bot retries on its next tick, so failing fast is the useful
-            # behaviour here.
+            # aiohttp defaults to a 300s total timeout, so one hung request would
+            # stall a cycle for five minutes with nothing logged. The next tick
+            # retries anyway, so failing fast is the useful behaviour.
             timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             self._session = aiohttp.ClientSession(
                 headers=self._headers(), timeout=timeout
@@ -149,12 +146,9 @@ class GitHubArchive:
     ):
         """Call the GitHub API.
 
-        ``allow_missing`` defaults to nothing, so a 404 raises. That is the
-        strict default on purpose: a swallowed error would return ``None`` and
-        let a caller believe a write had landed when it had not. The handful of
-        places where a missing object is genuinely expected -- an empty
-        repository, a branch that does not exist yet, a file not yet published
-        -- pass the statuses they tolerate explicitly.
+        ``allow_missing`` defaults to nothing so a 404 raises: a swallowed error
+        returns ``None`` and lets a caller believe a write landed when it did
+        not. The few sites that expect a missing object pass it explicitly.
         """
         if not self.configured:
             raise ArchiveError("GitHub archive is not configured")
@@ -172,14 +166,12 @@ class GitHubArchive:
         return f"/repos/{self.owner}/{self.repo}{suffix}"
 
     async def _bootstrap(self) -> None:
-        """Ensure the archive has a commit for the configured branch to build on.
+        """Ensure the configured branch has a commit to build on.
 
-        Two distinct cases. A repository with no commits at all cannot accept
-        blobs, so it is seeded with a commit through the contents API -- that
-        request must omit ``branch``, because the API answers 404 for a branch
-        that does not exist yet rather than creating it. A repository that
-        already has commits only needs the configured branch pointed at the
-        default branch's head.
+        With no commits at all the repo cannot accept blobs, so it is seeded via
+        the contents API -- which must omit ``branch``, since the API 404s for a
+        branch that does not exist rather than creating it. Otherwise the branch
+        only needs pointing at the default branch's head.
         """
         logger.info("Archive branch %s is absent; seeding it from the default branch", self.branch)
         repo = await self._api("GET", self._repo_path(""), allow_missing=())
@@ -253,17 +245,11 @@ class GitHubArchive:
         return payloads
 
     def pending_payloads(self) -> dict[str, bytes]:
-        """Snapshot the local buffers.
-
-        Callers that mutate those files should hold their own lock around this
-        and around :meth:`clear_published`, so no lock is held while the
-        publish round trips are in flight.
-        """
+        """Snapshot the buffers; callers lock around this and clear_published."""
         return self._local_payloads()
 
     @staticmethod
     def _spec_for(path: str):
-        """Resolve the CSV schema for an archive path, or None if it is not CSV."""
         if not path.endswith(".csv"):
             return None
         if path.rsplit("/", 1)[-1] == USER_MAP_FILE:
@@ -273,7 +259,6 @@ class GitHubArchive:
     async def _read_remote_rows(
         self, path: str, blob_sha: str | None, fields: list[str]
     ) -> list[dict[str, str]]:
-        """Fetch and parse an already-published CSV so new rows can be merged into it."""
         if not blob_sha:
             return []
         blob = await self._api("GET", self._repo_path(f"/git/blobs/{blob_sha}"))
@@ -284,16 +269,10 @@ class GitHubArchive:
         dry_run: bool = False,
         payloads: dict[str, bytes] | None = None,
     ) -> dict[str, list[str]]:
-        """Append buffered rows to the archive, returning the keys committed.
+        """Append buffered rows, returning the keys committed.
 
-        Strictly append-only. Rows already present remotely are skipped, and no
-        path is ever deleted, so a publish can only ever grow the archive. That
-        also removes the hazard of publishing from a machine with no local data:
-        there is nothing for an empty buffer to destroy.
-
-        ``payloads`` lets the caller hand in a snapshot taken under its own lock,
-        so this method performs no local file access and the caller can avoid
-        holding a lock across the network round trips.
+        ``payloads`` lets the caller pass a snapshot taken under its own lock, so
+        this touches no local files and no lock is held across the round trips.
         """
         if not self.configured:
             logger.info("GitHub archive not configured; skipping publish")
@@ -388,10 +367,9 @@ class GitHubArchive:
         return published
 
     async def verify(self, published: dict[str, list[str]]) -> list[str]:
-        """Re-read the archive and report any pushed key that is not there.
+        """Return any pushed key not yet readable from the remote.
 
-        An empty return means every committed row is readable from the remote,
-        which is what gates clearing the local buffer.
+        An empty return is what gates clearing the local buffer.
         """
         _, _, remote_paths = await self._remote_state()
         missing: list[str] = []
@@ -405,10 +383,8 @@ class GitHubArchive:
         return missing
 
     def clear_published(self, published: dict[str, list[str]]) -> None:
-        """Drop just the rows that were confirmed in the archive.
-
-        Removing by key rather than truncating the file means a message that
-        arrives mid-publish is preserved for the next cycle.
+        """Drop just the confirmed rows; keying rather than truncating is what
+        preserves a message that arrived mid-publish.
         """
         for path, keys in published.items():
             spec = self._spec_for(path)

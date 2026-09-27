@@ -1,8 +1,5 @@
-"""Shared CSV schema for the archive.
-
-The bot writes one CSV per channel and one per server for the user directory, and
-the publisher merges those into the archive. Both sides import this module so the
-column order and the flattening of a message record can never drift apart.
+"""Shared CSV schema, imported by both the bot and the publisher so the column
+order and message flattening cannot drift apart.
 """
 
 from __future__ import annotations
@@ -34,8 +31,8 @@ USER_KEY = "user_id"
 def message_row(record: Mapping[str, object]) -> dict[str, str]:
     """Flatten a captured message record into a single CSV row.
 
-    Attachment URLs are space separated: a URL cannot contain a space, and CSV
-    quoting of a newline-laden cell is awkward to consume downstream.
+    Attachment URLs are space separated: a URL cannot contain a space, and a
+    newline-laden cell is awkward to consume downstream.
     """
     reply = record.get("reply_to") or {}
     assert isinstance(reply, Mapping)
@@ -73,7 +70,6 @@ def load_csv(payload: bytes, fields: list[str]) -> list[dict[str, str]]:
 
 
 def append_row(path: Path, fields: list[str], row: Mapping[str, str]) -> None:
-    """Append one row, writing the header first if the file is new or empty."""
     path.parent.mkdir(parents=True, exist_ok=True)
     needs_header = not path.exists() or path.stat().st_size == 0
     with path.open("a", newline="", encoding="utf-8") as handle:

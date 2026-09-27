@@ -6,8 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# ca-certificates only: publishing goes through the GitHub API, so no git binary
-# is needed in the image.
+# ca-certificates only: publishing goes through the API, so no git binary is needed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

@@ -1,11 +1,5 @@
-"""DihScrapper — live Discord chat scraper.
-
-Captures messages as they arrive and buffers them as CSV. Every PUSH_INTERVAL
-seconds the buffer is appended to the private archive repository, verified, and
-only then cleared, so the archive is the durable record and the local disk stays
-transient.
-
-Media is never downloaded. Every attachment is recorded by its CDN URL.
+"""DihScrapper: captures live Discord messages as CSV and appends them to a
+private GitHub archive. Attachments are recorded by CDN URL, never downloaded.
 """
 
 from __future__ import annotations
@@ -50,8 +44,7 @@ bot = discord.Client(intents=intents)
 archive = GitHubArchive(data_root=DATA_ROOT)
 _push_task: asyncio.Task[None] | None = None
 
-# on_message and the publish cycle both touch the same files, so every mutation
-# of the local buffer is serialised.
+# on_message and the publish cycle both mutate these files, so serialise them.
 _buffer_lock = asyncio.Lock()
 
 _unsafe = re.compile(r"[^A-Za-z0-9_-]")
@@ -74,7 +67,6 @@ def user_map_path(guild: discord.Guild) -> Path:
 
 
 def record_users(guild: discord.Guild, messages: list[dict]) -> None:
-    """Upsert authors into the server's user directory, keyed by user id."""
     path = user_map_path(guild)
     rows = {row["user_id"]: row for row in read_rows(path, USER_FIELDS)}
     for message in messages:
@@ -100,8 +92,7 @@ async def fetch_reference(
 
 
 async def build_message(message: discord.Message) -> dict:
-    # Media is recorded by reference only: nothing is downloaded, and images,
-    # videos and files alike keep their CDN URL.
+    # Nothing is downloaded: every attachment kind keeps its CDN URL.
     attachments = [attachment.url for attachment in message.attachments]
 
     reply_to = None
@@ -127,16 +118,11 @@ async def build_message(message: discord.Message) -> dict:
 
 
 async def push_once() -> None:
-    """One cycle: append the buffer to the archive, verify, then clear it.
+    """One cycle: append the buffer, verify, then clear it.
 
-    The clear is gated on verification, so a failed or partial push leaves the
-    buffer intact and the next cycle retries the same rows. Because the merge is
-    keyed on message id, a retry is idempotent even if the commit landed.
-
-    The lock is held only while reading and rewriting local files, never across
-    the network round trips. Clearing is keyed on the ids actually published, so
-    a message buffered while the push is in flight is simply not in that set and
-    is left on disk for the next cycle -- the lock is not what makes this safe.
+    Clearing is keyed on the ids actually published, so a message buffered while
+    the push is in flight is not in that set and stays on disk. The lock is not
+    what makes this safe; it only keeps local file mutations from interleaving.
     """
     try:
         async with _buffer_lock:
@@ -160,8 +146,7 @@ async def push_once() -> None:
             archive.clear_published(published)
         logger.info("Pushed and verified %d message(s); local buffer cleared", total)
     except Exception:
-        # Never let an unexpected error here end the cycle: the next tick simply
-        # retries, and the buffer is only ever cleared after verification.
+        # A raised error here would end push_loop and silently stop archiving.
         logger.exception("Push cycle failed, local buffer left intact")
 
 

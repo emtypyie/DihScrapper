@@ -1,13 +1,10 @@
 """End-to-end check of the append-only archive publisher.
 
-Creates a throwaway private repository, drives the real publish -> verify ->
-clear cycle against it, and deletes it, so the test never touches the live
-archive or its default branch.
-
-Covers the properties the bot depends on: a fresh archive bootstraps, buffered
-rows are appended, nothing is ever deleted, the buffer is only cleared once the
-rows are confirmed readable from the remote, a message arriving mid-publish
-survives the clear, and a re-push of identical rows is a no-op.
+Drives the real publish -> verify -> clear cycle against a throwaway private
+repository, which is deleted afterwards, so the live archive is never touched.
+Covers bootstrapping, appending, that nothing is ever deleted, that clearing is
+gated on verification, that a row landing mid-publish survives the clear, and
+that a re-push of identical rows is a no-op.
 
     python tests/test_publish.py
 """
@@ -59,9 +56,9 @@ def record(msg_id: int, content: str, attachments: list[str] | None = None,
 async def strict_errors() -> list[str]:
     """A 404 must raise, never be swallowed into a silent success.
 
-    Regression test. `_api` used to default to `allow_missing=(404,)`, so a
-    ref update that 404'd returned `None` and the caller reported a successful
-    publish while the branch had not moved at all.
+    Regression: ``_api`` used to default to ``allow_missing=(404,)``, so a ref
+    update that 404'd returned ``None`` and the caller reported a successful
+    publish while the branch had not moved.
     """
     from aiohttp import web
 
@@ -118,12 +115,11 @@ async def strict_errors() -> list[str]:
 
 
 async def resilient_cycle() -> list[str]:
-    """push_once must swallow failures and keep the buffer, and keep looping.
+    """push_once must contain failures and keep the buffer.
 
-    Regression test. clear_published() was the one call in the cycle without a
-    guard, so any error there propagated out of push_loop() and killed the task.
-    The bot then kept running and kept saying it was listening, but silently
-    stopped archiving forever.
+    Regression: clear_published() had no guard, so an error there propagated out
+    of push_loop() and killed the task -- the bot kept claiming it was listening
+    while silently archiving nothing.
     """
     failures: list[str] = []
 
