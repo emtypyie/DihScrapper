@@ -19,7 +19,7 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
-from upload_data import GitHubArchive
+from upload_data import ArchiveError, GitHubArchive
 
 load_dotenv()
 
@@ -132,13 +132,15 @@ async def store_image(
                     )
                     return None
         relative = (
-            Path(sanitize(guild.name)) / "mediapool" / f"{attachment.id}_{attachment.filename}"
+            Path(sanitize(guild.name))
+            / "mediapool"
+            / f"{attachment.id}_{sanitize(attachment.filename)}"
         ).as_posix()
         blob = await archive.store_blob(bytes(buffer))
         _media_index[relative] = blob
         archive.save_media_index(_media_index)
         return relative
-    except (aiohttp.ClientError, OSError) as exc:
+    except (aiohttp.ClientError, OSError, ArchiveError) as exc:
         logger.warning("Failed to store media %s: %s", attachment.id, exc)
         return None
 
