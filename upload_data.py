@@ -1,22 +1,34 @@
-"""Sync the local HOME data directory to the private ScrapedDih GitHub repository.
+"""Publish the local archive to the private GitHub data repository.
 
-Usable as a library from ``main.py`` or as a one-shot CLI::
+Media is never written to disk. Attachments are uploaded straight into the archive
+repository as git blobs by :meth:`GitHubArchive.store_blob`, and the path-to-blob
+mapping is kept in ``HOME/.media-index.json`` so later commits can reference those
+blobs without ever holding the bytes locally. The local ``HOME`` tree therefore
+contains JSON only.
 
-    python upload_data.py            # one sync then exit
-    python upload_data.py --loop     # sync every PUSH_INTERVAL seconds
-    python upload_data.py --dry-run  # report what would be pushed
+Every commit is assembled through the git data API: blobs, then a tree layered on
+the current remote tree, then a commit, then a ref update. Files whose git blob hash
+already matches the remote are skipped, so a steady-state sync costs two API calls
+regardless of archive size.
+
+Usable as a library from ``main.py`` or standalone::
+
+    python upload_data.py            # publish once, then exit
+    python upload_data.py --dry-run  # report what would change
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import os
-import stat
-import tempfile
 from pathlib import Path
 
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,30 +41,24 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "HOME"))
 PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
-SOFT_SIZE_LIMIT = int(os.environ.get("REPO_SOFT_SIZE_LIMIT", str(1024**3)))
-COMMIT_NAME = os.environ.get("GIT_COMMIT_NAME", "DihScrapper Bot")
-COMMIT_EMAIL = os.environ.get("GIT_COMMIT_EMAIL", "dihscrapper@users.noreply.github.com")
+API_ROOT = "https://api.github.com"
 
-ASKPASS_SH = """#!/bin/sh
-case "$1" in
-  *sername*) printf '%s' "$GIT_ASKPASS_USERNAME" ;;
-  *) printf '%s' "$GIT_ASKPASS_PASSWORD" ;;
-esac
-"""
-
-ASKPASS_BAT = """@echo off
-echo %1 | findstr /i "username" >nul
-if %ERRORLEVEL%==0 (echo %GIT_ASKPASS_USERNAME%) else (echo %GIT_ASKPASS_PASSWORD%)
-"""
+MEDIA_INDEX = ".media-index.json"
+BOOTSTRAP_FILE = ".archive"
+BOOTSTRAP_BODY = b"DihScrapper live archive. Managed automatically; do not edit.\n"
+EMPTY_REPO = "git repository is empty"
+FILE_MODE = "100644"
 
 
-class SyncError(RuntimeError):
+class ArchiveError(RuntimeError):
     pass
 
 
-class DataRepoSync:
-    """Commits the data directory to the remote archive repository."""
+def git_blob_sha(payload: bytes) -> str:
+    return hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
 
+
+class GitHubArchive:
     def __init__(
         self,
         data_root: Path | None = None,
@@ -60,185 +66,268 @@ class DataRepoSync:
         repo: str = GITHUB_DATA_REPO,
         token: str = GITHUB_TOKEN,
         branch: str = GITHUB_BRANCH,
-        dry_run: bool = False,
+        session: aiohttp.ClientSession | None = None,
     ) -> None:
         self.data_root = Path(data_root or DATA_ROOT)
         self.owner = owner
         self.repo = repo
         self.token = token
         self.branch = branch
-        self.dry_run = dry_run
-        self.remote = f"https://github.com/{owner}/{repo}.git"
-        self._askpass_dir: Path | None = None
+        self._session = session
+        self._owns_session = session is None
 
     @property
     def configured(self) -> bool:
         return bool(self.owner and self.repo and self.token)
 
-    def _git_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_ASKPASS_USERNAME"] = "x-access-token"
-        env["GIT_ASKPASS_PASSWORD"] = self.token
-        env["LC_ALL"] = "C"
-        if self._askpass_dir:
-            script = self._askpass_dir / (
-                "askpass.bat" if os.name == "nt" else "askpass.sh"
-            )
-            env["GIT_ASKPASS"] = str(script)
-        return env
+    @property
+    def index_path(self) -> Path:
+        return self.data_root / MEDIA_INDEX
 
-    async def _git(self, *args: str, check: bool = True) -> tuple[int, str, str]:
-        cmd = [
-            "git",
-            "-c", "safe.directory=*",
-            "-c", "credential.helper=",
-            *args,
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=self.data_root,
-            env=self._git_env(),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, err = await proc.communicate()
-        stdout, stderr = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
-        if check and proc.returncode != 0:
-            raise SyncError(f"git {' '.join(args)} failed: {stderr.strip() or stdout.strip()}")
-        return proc.returncode, stdout, stderr
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "DihScrapper",
+        }
 
-    def _write_askpass(self) -> None:
-        self._askpass_dir = Path(tempfile.mkdtemp(prefix="dihscrapper-askpass-"))
-        if os.name == "nt":
-            script = self._askpass_dir / "askpass.bat"
-            script.write_text(ASKPASS_BAT, encoding="utf-8")
-        else:
-            script = self._askpass_dir / "askpass.sh"
-            script.write_text(ASKPASS_SH, encoding="utf-8")
-            script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            self._session = aiohttp.ClientSession(headers=self._headers())
+        return self._session
 
-    def _cleanup_askpass(self) -> None:
-        if self._askpass_dir and self._askpass_dir.exists():
-            for child in self._askpass_dir.iterdir():
-                child.unlink(missing_ok=True)
-            self._askpass_dir.rmdir()
-        self._askpass_dir = None
+    async def close(self) -> None:
+        if self._owns_session and self._session is not None:
+            await self._session.close()
+            self._session = None
 
-    def data_size(self) -> int:
-        return sum(p.stat().st_size for p in self.data_root.rglob("*") if p.is_file())
+    async def _api(
+        self,
+        method: str,
+        path: str,
+        payload: object = None,
+        allow_missing: tuple[int, ...] = (404,),
+    ):
+        if not self.configured:
+            raise ArchiveError("GitHub archive is not configured")
+        session = await self._ensure_session()
+        body = json.dumps(payload).encode() if payload is not None else None
+        async with session.request(method, f"{API_ROOT}{path}", data=body) as response:
+            text = await response.text()
+            if response.status in allow_missing:
+                return None
+            if response.status >= 400:
+                raise ArchiveError(f"{method} {path} failed ({response.status}): {text[:300]}")
+            return json.loads(text) if text else None
 
-    async def ensure_repo(self) -> None:
+    def _repo_path(self, suffix: str) -> str:
+        return f"/repos/{self.owner}/{self.repo}{suffix}"
+
+    def load_media_index(self) -> dict[str, str]:
+        try:
+            with self.index_path.open(encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def save_media_index(self, index: dict[str, str]) -> None:
         self.data_root.mkdir(parents=True, exist_ok=True)
-        self._write_askpass()
-        if not (self.data_root / ".git").exists():
-            await self._git("init", "-b", self.branch)
-            await self._git("remote", "add", "origin", self.remote)
-            logger.info("Initialised data repository for %s", self.remote)
-        else:
-            code, out, _ = await self._git("remote", "get-url", "origin", check=False)
-            if code != 0:
-                await self._git("remote", "add", "origin", self.remote)
-            elif out.strip() != self.remote:
-                await self._git("remote", "set-url", "origin", self.remote)
+        staging = self.index_path.with_suffix(".tmp")
+        with staging.open("w", encoding="utf-8") as handle:
+            json.dump(index, handle, indent=1, sort_keys=True)
+        staging.replace(self.index_path)
 
-    async def _has_revision(self, revision: str) -> bool:
-        return (await self._git("rev-parse", "--verify", "--quiet", revision, check=False))[0] == 0
+    async def store_blob(self, payload: bytes) -> str:
+        """Upload bytes into the archive repository and return the git blob hash.
 
-    async def _integrate_remote(self) -> None:
-        code, _, err = await self._git(
-            "fetch", "--depth", "1", "origin", self.branch, check=False
+        GitHub rejects blob creation against a repository with no commits, so an
+        empty archive is bootstrapped with an initial commit first.
+        """
+        encoded = base64.b64encode(payload).decode()
+        try:
+            return await self._create_blob(encoded)
+        except ArchiveError as exc:
+            if EMPTY_REPO not in str(exc).lower():
+                raise
+        await self._bootstrap()
+        return await self._create_blob(encoded)
+
+    async def _create_blob(self, encoded: str) -> str:
+        result = await self._api(
+            "POST",
+            self._repo_path("/git/blobs"),
+            {"content": encoded, "encoding": "base64"},
         )
-        if code != 0 and "not found" in err.lower() and "repository" in err.lower():
-            raise SyncError(f"cannot reach {self.remote}: {err.strip()}")
+        return result["sha"]
 
-        remote_exists = code == 0 and await self._has_revision("FETCH_HEAD")
-        local_exists = await self._has_revision("HEAD")
-
-        if not remote_exists:
-            logger.info("Remote branch %s has no commits yet; it will be created", self.branch)
-            return
-
-        if not local_exists:
-            await self._git("reset", "--hard", "FETCH_HEAD")
-            return
-
-        code, _, _ = await self._git("merge", "--ff-only", "FETCH_HEAD", check=False)
-        if code == 0:
-            return
-
-        code, _, err = await self._git("rebase", "FETCH_HEAD", check=False)
-        if code == 0:
-            return
-
-        await self._git("rebase", "--abort", check=False)
-        raise SyncError(
-            "local and remote history diverged and could not be rebased "
-            f"({err.strip()}); archive left untouched, resolve manually"
+    async def _bootstrap(self) -> None:
+        logger.info("Archive repository is empty; creating its initial commit")
+        await self._api(
+            "PUT",
+            self._repo_path(f"/contents/{BOOTSTRAP_FILE}"),
+            {
+                "message": "Initialise archive",
+                "content": base64.b64encode(BOOTSTRAP_BODY).decode(),
+                "branch": self.branch,
+            },
         )
 
-    async def _commit_changes(self) -> bool:
-        await self._git("add", "-A", ".")
-        code, out, _ = await self._git("diff", "--cached", "--quiet", check=False)
-        if code == 0:
-            logger.info("No new data to push")
+    async def _remote_state(self) -> tuple[str | None, str | None, dict[str, str]]:
+        ref = await self._api(
+            "GET",
+            self._repo_path(f"/git/ref/heads/{self.branch}"),
+            allow_missing=(404, 409),
+        )
+        if ref is None:
+            logger.info("Archive branch %s does not exist yet", self.branch)
+            return None, None, {}
+        commit_sha = ref["object"]["sha"]
+        commit = await self._api("GET", self._repo_path(f"/git/commits/{commit_sha}"))
+        tree_sha = commit["tree"]["sha"]
+        paths = await self._collect_paths(tree_sha)
+        return commit_sha, tree_sha, paths
+
+    async def _collect_paths(self, tree_sha: str) -> dict[str, str]:
+        collected: dict[str, str] = {}
+        pending = [("", tree_sha)]
+        while pending:
+            prefix, sha = pending.pop()
+            data = await self._api("GET", self._repo_path(f"/git/trees/{sha}"))
+            for entry in data.get("tree", []):
+                path = f"{prefix}{entry['path']}"
+                if entry["type"] == "tree":
+                    pending.append((f"{path}/", entry["sha"]))
+                elif entry["type"] == "blob":
+                    collected[path] = entry["sha"]
+        return collected
+
+    def _local_payloads(self) -> dict[str, bytes]:
+        payloads: dict[str, bytes] = {}
+        for path in sorted(self.data_root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(self.data_root).as_posix()
+            if relative.startswith(".") or path.name.startswith("."):
+                continue
+            payloads[relative] = path.read_bytes()
+        return payloads
+
+    async def publish(self, dry_run: bool = False) -> bool:
+        """Commit local JSON plus indexed media blobs to the archive repository."""
+        if not self.configured:
+            logger.info("GitHub archive not configured; skipping publish")
             return False
-        _, staged_out, _ = await self._git("diff", "--cached", "--name-only", check=False)
-        staged = len([line for line in staged_out.splitlines() if line.strip()])
-        message = f"Archive sync: {staged} path(s) updated"
-        await self._git(
-            "-c", f"user.name={COMMIT_NAME}",
-            "-c", f"user.email={COMMIT_EMAIL}",
-            "commit", "-m", message,
+
+        head_sha, tree_sha, remote_paths = await self._remote_state()
+        payloads = self._local_payloads()
+        media = self.load_media_index()
+
+        entries: list[dict] = []
+        added: list[str] = []
+        changed: list[str] = []
+        for path, payload in payloads.items():
+            blob = git_blob_sha(payload)
+            if remote_paths.get(path) == blob:
+                continue
+            entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": blob})
+            (added if path not in remote_paths else changed).append(path)
+
+        for path, blob in media.items():
+            if path in payloads or remote_paths.get(path) == blob:
+                continue
+            entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": blob})
+            (added if path not in remote_paths else changed).append(path)
+
+        keep = set(payloads) | set(media)
+        removed = [
+            path
+            for path in remote_paths
+            if path not in keep and not path.startswith(".")
+        ]
+        for path in removed:
+            entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": None})
+
+        if not entries:
+            logger.info("Archive already up to date (%d file(s) tracked)", len(remote_paths))
+            return False
+
+        if dry_run:
+            logger.info(
+                "[dry-run] +%d ~%d -%d", len(added), len(changed), len(removed)
+            )
+            for path in added[:20]:
+                logger.info("[dry-run] add    %s", path)
+            for path in changed[:20]:
+                logger.info("[dry-run] update %s", path)
+            for path in removed[:20]:
+                logger.info("[dry-run] remove %s", path)
+            return True
+
+        await self._create_blobs(payloads, entries)
+        new_tree = await self._api(
+            "POST",
+            self._repo_path("/git/trees"),
+            {
+                "base_tree": tree_sha,
+                "tree": entries,
+            } if tree_sha else {"tree": entries},
         )
-        logger.info("Committed %d changed path(s)", staged)
+        parents = [head_sha] if head_sha else []
+        commit = await self._api(
+            "POST",
+            self._repo_path("/git/commits"),
+            {
+                "message": f"Archive sync: +{len(added)} ~{len(changed)} -{len(removed)}",
+                "tree": new_tree["sha"],
+                "parents": parents,
+            },
+        )
+        await self._write_ref(commit["sha"], head_sha)
+        logger.info(
+            "Published archive to %s/%s@%s (+%d ~%d -%d)",
+            self.owner, self.repo, self.branch, len(added), len(changed), len(removed),
+        )
         return True
 
-    async def sync(self) -> bool:
-        """Push local data to the remote archive. Returns True if a push happened."""
-        if not self.configured:
-            logger.info("GitHub archive not configured (owner/repo/token); skipping sync")
-            return False
+    async def _create_blobs(self, payloads: dict[str, bytes], entries: list[dict]) -> None:
+        wanted = {
+            path: payload
+            for path, payload in payloads.items()
+            if any(e["path"] == path and e.get("sha") for e in entries)
+        }
+        for path, payload in wanted.items():
+            await self.store_blob(payload)
 
-        size = self.data_size()
-        if size > SOFT_SIZE_LIMIT:
-            logger.warning(
-                "Archive directory is %.1f MiB, above the %.1f MiB soft limit; "
-                "GitHub will reject repositories past its hard cap",
-                size / 1024**2, SOFT_SIZE_LIMIT / 1024**2,
-            )
-
-        await self.ensure_repo()
-        try:
-            await self._integrate_remote()
-            if self.dry_run:
-                code, out, _ = await self._git("status", "--porcelain", check=False)
-                changed = [line for line in out.splitlines() if line.strip()]
-                logger.info("[dry-run] %d path(s) would be pushed", len(changed))
-                return bool(changed)
-
-            if not await self._commit_changes():
-                return False
-
-            code, _, err = await self._git("push", "origin", self.branch, check=False)
-            if code != 0:
-                raise SyncError(f"push failed: {err.strip()}")
-            logger.info("Pushed archive data to %s", self.remote)
-            return True
-        finally:
-            self._cleanup_askpass()
+    async def _write_ref(self, commit_sha: str, previous: str | None) -> None:
+        if previous is None:
+            try:
+                await self._api(
+                    "POST",
+                    self._repo_path("/git/refs"),
+                    {"ref": f"refs/heads/{self.branch}", "sha": commit_sha},
+                )
+                return
+            except ArchiveError as exc:
+                if "already exists" not in str(exc).lower():
+                    raise
+        await self._api(
+            "PATCH",
+            self._repo_path(f"/git/refs/heads/{self.branch}"),
+            {"sha": commit_sha, "force": False},
+        )
 
 
-async def _loop(interval: int, dry_run: bool) -> None:
-    sync = DataRepoSync(dry_run=dry_run)
-    while True:
-        try:
-            await sync.sync()
-        except SyncError as exc:
-            logger.error("Archive sync failed: %s", exc)
-        except Exception:
-            logger.exception("Unexpected archive sync failure")
-        await asyncio.sleep(interval)
+async def _run(args: argparse.Namespace) -> None:
+    archive = GitHubArchive()
+    try:
+        await archive.publish(dry_run=args.dry_run)
+    except ArchiveError as exc:
+        logger.error("Publish failed: %s", exc)
+        raise SystemExit(1) from exc
+    finally:
+        await archive.close()
 
 
 def main() -> None:
@@ -246,18 +335,10 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--loop", action="store_true", help="sync continuously")
-    parser.add_argument("--dry-run", action="store_true", help="do not commit or push")
-    parser.add_argument(
-        "--interval", type=int, default=PUSH_INTERVAL, help="seconds between syncs"
-    )
+    parser = argparse.ArgumentParser(description="Publish the archive to GitHub.")
+    parser.add_argument("--dry-run", action="store_true", help="report without committing")
     args = parser.parse_args()
-
-    if args.loop:
-        asyncio.run(_loop(args.interval, args.dry_run))
-    else:
-        asyncio.run(DataRepoSync(dry_run=args.dry_run).sync())
+    asyncio.run(_run(args))
 
 
 if __name__ == "__main__":

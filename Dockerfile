@@ -19,6 +19,6 @@ COPY main.py upload_data.py ./
 RUN mkdir -p /app/HOME
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD test -d /app/HOME/.git || exit 1
+    CMD test -d /app/HOME && test -w /app/HOME || exit 1
 
 CMD ["python", "main.py"]

@@ -1,4 +1,9 @@
-"""DihScrapper — Discord chat scraper and media archiver."""
+"""DihScrapper — live Discord chat scraper and media archiver.
+
+Captures messages as they arrive, stores the transcripts as JSON, and pushes media
+straight into the private archive repository as git blobs. Media is never written to
+the local filesystem.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ import aiohttp
 import discord
 from dotenv import load_dotenv
 
-from upload_data import DataRepoSync
+from upload_data import GitHubArchive
 
 load_dotenv()
 
@@ -26,8 +31,6 @@ logger = logging.getLogger("DihScrapper")
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "HOME"))
 MEDIA_MAX_SIZE = int(os.environ.get("MEDIA_MAX_SIZE", "25")) * 1024 * 1024
-CATCHUP_LIMIT = int(os.environ.get("CATCHUP_LIMIT", "200"))
-CATCHUP_MAX = int(os.environ.get("CATCHUP_MAX", "5000"))
 PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
 CHUNK_SIZE = 64 * 1024
 
@@ -36,8 +39,9 @@ intents.message_content = True
 intents.members = True
 bot = discord.Client(intents=intents)
 
-archive = DataRepoSync(data_root=DATA_ROOT)
+archive = GitHubArchive(data_root=DATA_ROOT)
 _push_task: asyncio.Task[None] | None = None
+_media_index: dict[str, str] = {}
 
 _unsafe = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -58,10 +62,6 @@ def user_map_path(guild: discord.Guild) -> Path:
     return server_dir(guild) / "user_map.json"
 
 
-def mediapool_dir(guild: discord.Guild) -> Path:
-    return server_dir(guild) / "mediapool"
-
-
 def load_messages(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -76,21 +76,10 @@ def load_messages(path: Path) -> list[dict]:
 
 def write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
+    staging = path.with_name(path.name + ".tmp")
+    with staging.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
-    tmp.replace(path)
-
-
-def merge_messages(existing: list[dict], incoming: list[dict]) -> list[dict]:
-    known = {m.get("id") for m in existing}
-    merged = list(existing)
-    for message in incoming:
-        if message.get("id") not in known:
-            merged.append(message)
-            known.add(message.get("id"))
-    merged.sort(key=lambda m: m.get("id", 0))
-    return merged
+    staging.replace(path)
 
 
 def record_users(guild: discord.Guild, messages: list[dict]) -> None:
@@ -121,54 +110,54 @@ async def fetch_reference(
         return None
 
 
-async def archive_image(
-    session: aiohttp.ClientSession,
-    attachment: discord.Attachment,
-    guild: discord.Guild,
-) -> Path | None:
-    """Stream an attachment into mediapool, discarding it if it exceeds the size cap."""
-    destination = mediapool_dir(guild) / f"{attachment.id}_{attachment.filename}"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = destination.with_suffix(destination.suffix + ".part")
-    written = 0
+async def store_image(
+    session: aiohttp.ClientSession, attachment: discord.Attachment, guild: discord.Guild
+) -> str | None:
+    """Stream an attachment and commit it to the archive as a git blob.
+
+    Returns the archive-relative path, or None if the media could not be stored.
+    """
+    buffer = bytearray()
     try:
         async with session.get(attachment.url) as response:
             if response.status != 200:
                 logger.warning("Media %s returned HTTP %s", attachment.id, response.status)
                 return None
-            async with staging.open("wb") as handle:
-                async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                    written += len(chunk)
-                    if written > MEDIA_MAX_SIZE:
-                        logger.warning(
-                            "Media %s exceeds %d MiB; keeping CDN URL",
-                            attachment.id, MEDIA_MAX_SIZE // 1024**2,
-                        )
-                        return None
-                    handle.write(chunk)
-        staging.replace(destination)
+            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                buffer.extend(chunk)
+                if len(buffer) > MEDIA_MAX_SIZE:
+                    logger.warning(
+                        "Media %s exceeds the %d MiB cap; keeping the CDN URL",
+                        attachment.id, MEDIA_MAX_SIZE // 1024**2,
+                    )
+                    return None
+        relative = (
+            Path(sanitize(guild.name)) / "mediapool" / f"{attachment.id}_{attachment.filename}"
+        ).as_posix()
+        blob = await archive.store_blob(bytes(buffer))
+        _media_index[relative] = blob
+        archive.save_media_index(_media_index)
+        return relative
     except (aiohttp.ClientError, OSError) as exc:
-        logger.warning("Failed to archive media %s: %s", attachment.id, exc)
+        logger.warning("Failed to store media %s: %s", attachment.id, exc)
         return None
-    finally:
-        staging.unlink(missing_ok=True)
-    return destination
 
 
 async def build_message(message: discord.Message) -> dict:
     stored: list[str] = []
-    oversized: list[str] = []
+    remote_only: list[str] = []
 
-    for attachment in message.attachments:
-        if not (attachment.content_type or "").startswith("image/"):
-            oversized.append(attachment.url)
-            continue
+    if message.attachments:
         async with aiohttp.ClientSession() as session:
-            saved = await archive_image(session, attachment, message.guild)
-        if saved is None:
-            oversized.append(attachment.url)
-        else:
-            stored.append(saved.relative_to(DATA_ROOT).as_posix())
+            for attachment in message.attachments:
+                if not (attachment.content_type or "").startswith("image/"):
+                    remote_only.append(attachment.url)
+                    continue
+                path = await store_image(session, attachment, message.guild)
+                if path is None:
+                    remote_only.append(attachment.url)
+                else:
+                    stored.append(path)
 
     reply_to = None
     if message.reference and message.reference.message_id:
@@ -190,92 +179,32 @@ async def build_message(message: discord.Message) -> dict:
         "attachments": stored,
         "reply_to": reply_to,
     }
-    if oversized:
-        record["media_size_exceeded"] = oversized
+    if remote_only:
+        record["media_size_exceeded"] = remote_only
     return record
 
 
-async def collect_history(
-    channel: discord.TextChannel, after_id: int | None
-) -> list[dict]:
-    if after_id:
-        history = channel.history(limit=CATCHUP_MAX, after=discord.Object(after_id))
-    else:
-        history = channel.history(limit=CATCHUP_LIMIT)
-    records = [await build_message(message) async for message in history]
-    if len(records) >= CATCHUP_MAX:
-        logger.warning(
-            "Channel #%s hit the %d message catch-up cap; some history may be missing",
-            channel.name, CATCHUP_MAX,
-        )
-    return records
-
-
-async def archive_channel(channel: discord.TextChannel) -> int:
-    path = channel_path(channel)
-    existing = load_messages(path)
-    watermark = max((m.get("id", 0) for m in existing), default=0)
-    if not watermark:
-        logger.info("#%s has no local history; backfilling %d messages", channel.name, CATCHUP_LIMIT)
-
-    records = await collect_history(channel, watermark or None)
-    if not records:
-        return 0
-
-    merged = merge_messages(existing, records)
-    write_json(path, merged)
-    record_users(channel.guild, records)
-    logger.info(
-        "Archived %d message(s) from #%s (%s); log now holds %d",
-        len(records), channel.name, channel.guild.name, len(merged),
-    )
-    return len(records)
-
-
-async def catchup_guild(guild: discord.Guild) -> None:
-    logger.info("Catching up %s", guild.name)
-    total = 0
-    for channel in guild.text_channels:
-        if not channel.permissions_for(guild.me).read_message_history:
-            logger.debug("Skipping #%s: no read permission", channel.name)
-            continue
-        try:
-            total += await archive_channel(channel)
-        except discord.HTTPException as exc:
-            logger.warning("Catch-up failed for #%s: %s", channel.name, exc)
-    logger.info("Catch-up for %s added %d message(s)", guild.name, total)
-    await push_archive()
-
-
-async def push_archive() -> None:
+async def publish() -> None:
     try:
-        await archive.sync()
+        await archive.publish()
     except Exception as exc:
-        logger.error("Archive push failed: %s", exc)
+        logger.error("Archive publish failed: %s", exc)
 
 
 async def push_loop() -> None:
     await bot.wait_until_ready()
     while True:
         await asyncio.sleep(PUSH_INTERVAL)
-        await push_archive()
+        await publish()
 
 
 @bot.event
 async def on_ready() -> None:
     global _push_task
-    logger.info("Authenticated as %s", bot.user)
+    _media_index.update(archive.load_media_index())
+    logger.info("Authenticated as %s, listening for new messages", bot.user)
     if _push_task is None or _push_task.done():
         _push_task = asyncio.create_task(push_loop())
-    for guild in bot.guilds:
-        await catchup_guild(guild)
-
-
-@bot.event
-async def on_resumed() -> None:
-    logger.info("Gateway session resumed; re-running catch-up")
-    for guild in bot.guilds:
-        await catchup_guild(guild)
 
 
 @bot.event
@@ -288,11 +217,22 @@ async def on_message(message: discord.Message) -> None:
     if bot.user in message.mentions:
         print("Makima is Listening :3")
 
-    records = [await build_message(message)]
+    record = await build_message(message)
     path = channel_path(message.channel)
-    write_json(path, merge_messages(load_messages(path), records))
-    record_users(message.guild, records)
+    write_json(path, merge_messages(load_messages(path), [record]))
+    record_users(message.guild, [record])
     logger.debug("Archived message %s from #%s", message.id, message.channel.name)
+
+
+def merge_messages(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    known = {m.get("id") for m in existing}
+    merged = list(existing)
+    for message in incoming:
+        if message.get("id") not in known:
+            merged.append(message)
+            known.add(message.get("id"))
+    merged.sort(key=lambda m: m.get("id", 0))
+    return merged
 
 
 async def wait_for_shutdown(stop: asyncio.Event) -> None:
@@ -309,14 +249,13 @@ async def main() -> None:
     stop = asyncio.Event()
     runner = asyncio.create_task(bot.start(os.environ["DISCORD_API"]))
     waiter = asyncio.create_task(wait_for_shutdown(stop))
-    done, pending = await asyncio.wait(
-        {runner, waiter}, return_when=asyncio.FIRST_COMPLETED
-    )
+    done, pending = await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
     if not bot.is_closed():
         await bot.close()
+    await archive.close()
     if runner in done and (failure := runner.exception()) is not None:
         raise failure
     logger.info("Shutdown complete")

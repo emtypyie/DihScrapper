@@ -15,8 +15,6 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       DISCORD_API: ${DISCORD_API}
       MEDIA_MAX_SIZE: 25
-      CATCHUP_LIMIT: 200
-      CATCHUP_MAX: 5000
       PUSH_INTERVAL: 300
     volumes:
       - home:/app/HOME
