@@ -9,17 +9,19 @@ lol.
 
 DihScrapper is a self-hosted Discord bot that mirrors messages into a private GitHub
 repository as they arrive. Point it at a server, invite it, and it builds a timestamped
-JSON transcript of the conversation — text, replies, attachments, and the user directory
-that ties them together. Point a training pipeline at the repo and you have a dataset that
-keeps itself current.
+JSON transcript of the conversation — text, replies, and the user directory that ties
+them together. Point a training pipeline at the repo and you have a dataset that keeps
+itself current.
 
-Two properties shape the design:
+Three properties shape the design:
 
 - **It captures the live stream only.** There is no backfill. Nothing that was said before
   the bot connected is ever read. The archive begins when the bot starts.
-- **Media never touches the local disk.** Attachments are uploaded straight into the
-  archive repository as git blobs. The container's filesystem holds JSON and nothing else,
-  so the volume stays small no matter how much media flows through.
+- **Media is never stored.** Attachments are not downloaded at all. An image is recorded
+  as the literal string `[potential image]`, so the archive stays pure text and the scraper
+  stays cheap to run.
+- **Text only, no binaries.** Every file in the archive is a small JSON document. There are
+  no images, videos, or blobs to bloat the repository.
 
 Because the archive lives in Git, the scraper can be killed, redeployed, or moved to
 another host and pick up exactly where it left off.
@@ -31,41 +33,42 @@ The bot runs a single event loop over the channels it has been invited to.
 1. **Listen.** `on_message` fires for every new message. Messages authored by the bot
    itself are dropped so it never archives its own output.
 2. **Build a record.** Each message becomes one JSON object: snowflake ID, ISO timestamp,
-   author name and ID, content, archived attachment paths, and a `reply_to` block when the
+   author name and ID, content, an `attachments` list, and a `reply_to` block when the
    message answers another.
-3. **Archive media.** Images stream into memory and are committed to the archive as git
-   blobs, then discarded. Nothing is written to disk. Anything over `MEDIA_MAX_SIZE` is
-   never uploaded — its CDN URL is recorded instead and the message is tagged
-   `media_size_exceeded`.
+3. **Note attachments, not bytes.** An image attachment contributes the placeholder
+   `[potential image]` to `attachments`. Any other kind of file contributes its CDN URL, so
+   the reference survives even though the bytes were never fetched.
 4. **Track the directory.** Each server keeps a `user_map.json` of `username → user_id`, so
    author names stay resolvable to stable identities after display names change.
 5. **Publish.** Every `PUSH_INTERVAL` seconds the local JSON is committed to the archive
-   repository, alongside every media blob recorded so far.
+   repository.
 
 Transcript writes are atomic — staged to a temporary file and renamed into place — so a
 crash mid-write cannot leave a half-written log behind.
 
 ## Publishing model
 
-The archive is written through the GitHub git data API rather than a local git worktree.
-A publish run:
+The archive is written through the GitHub git data API rather than a local git worktree. A
+publish run:
 
 1. Reads the current branch ref and walks the remote tree to learn every tracked path and
    its blob hash.
 2. Hashes each local file the same way git does. Files whose hash already matches the
    remote are skipped, so a steady-state sync costs two API calls no matter how large the
    archive grows.
-3. Uploads blobs for anything new or changed, including media blobs recorded earlier.
+3. Uploads blobs for anything new or changed.
 4. Posts a tree layered on the current remote tree, then a commit, then a ref update.
 
-Media blobs are recorded in `HOME/.media-index.json` as path-to-hash pairs. That index is
-local bookkeeping and is never published, which is what lets a later commit reference media
-whose bytes are long gone.
+Because the local `HOME` tree is treated as the source of truth, a path that disappears
+locally is deleted from the archive on the next publish.
 
-Two GitHub quirks are handled explicitly, both of which only appear on a brand-new archive:
-an empty repository answers ref lookups with `409` rather than `404`, and refuses blob
-creation outright, so the first blob bootstraps the repository with an initial commit
-through the contents API.
+### Starting from an empty repository
+
+GitHub will not create a blob in a repository that has no commits, so a brand-new archive
+is seeded before its first publish. If the repository already has commits but the
+configured branch does not, the branch is simply pointed at the default branch's head. If
+there are no commits at all, a seed file is committed through the contents API first, and
+only then are blobs created.
 
 ## Data layout
 
@@ -74,22 +77,18 @@ In the archive repository:
 ```text
 TestServer/
 ├── general.json
-├── user_map.json
-└── mediapool/
-    ├── 1234567890_image.png
-    └── 1234567891_photo.jpg
+└── user_map.json
 ```
 
 Server and channel names are stripped to `[A-Za-z0-9_-]` and capped at 64 characters.
 
-On disk, only the JSON exists:
+Locally, the same layout minus the repository:
 
 ```text
 HOME/
 └── [Sanitized_Server_Name]/
     ├── [Sanitized_Channel_Name].json
-    ├── user_map.json
-    └── .media-index.json
+    └── user_map.json
 ```
 
 Each entry in a channel transcript:
@@ -101,29 +100,29 @@ Each entry in a channel transcript:
   "author": "username_here",
   "author_id": 9876543210,
   "content": "Message string text here",
-  "attachments": ["Otaku_Valley/mediapool/1234567890_image.png"],
+  "attachments": ["[potential image]"],
   "reply_to": {
     "message_id": 1122334455,
     "author_id": 5544332211,
     "author_username": "original_poster",
     "content_snippet": "This was the text being replied to..."
-  },
-  "media_size_exceeded": ["https://cdn.discordapp.com/attachments/.../huge.png"]
+  }
 }
 ```
 
-`media_size_exceeded` only appears when at least one attachment was too large to archive.
+`attachments` is always present and is empty when the message had none. `[potential image]`
+is a fixed marker, not a path — nothing is fetched behind it.
 
 ## Repositories
 
 | Repository | Visibility | Contents |
 | --- | --- | --- |
 | `DihScrapper` | Public | This code. `HOME/` is gitignored and never enters it. |
-| `ScrapedDih` | Private | The archive. JSON transcripts plus media blobs. |
+| `ScrapedDih` | Private | The archive. JSON transcripts only. |
 
 `HOME/` belongs exclusively to the private archive and is gitignored in the code repo.
-The code lives on the main account; the archive lives on whichever account
-`GITHUB_OWNER` points at.
+The code lives on the main account; the archive lives on whichever account `GITHUB_OWNER`
+points at.
 
 ## Setup
 
@@ -178,8 +177,10 @@ All optional — the defaults are fine for most servers.
 | `GITHUB_OWNER` | `myrachane` | Archive repo owner. |
 | `GITHUB_DATA_REPO` | `ScrapedDih` | Archive repo name. |
 | `GITHUB_BRANCH` | `main` | Archive branch. |
-| `MEDIA_MAX_SIZE` | `25` | Max archived attachment size, in MiB. |
 | `PUSH_INTERVAL` | `300` | Seconds between publishes. |
+
+The bot publishes once on connect and then every `PUSH_INTERVAL` seconds, so a run shorter
+than the interval still leaves its messages in the archive.
 
 ## Publishing on demand
 
@@ -196,15 +197,16 @@ python upload_data.py --dry-run   # show what would change
 python tests/test_publish.py
 ```
 
-Creates a throwaway branch, asserts media reaches the tree as a blob while no media bytes
-land on disk, that unchanged data is a no-op, and that an edited transcript produces
-exactly one new commit with the expected blob hash. The branch is deleted afterwards.
+Creates a throwaway private repository, publishes to it, asserts the transcript reaches the
+tree with the correct blob hash, that no media or local bookkeeping file is committed, that
+unchanged data is a no-op, and that an edited transcript produces exactly one new commit.
+The repository is deleted afterwards, so the live archive is never touched.
 
 ## Notes
 
 - The bot archives only channels it can read, and only from the moment it connects.
-- Attachment downloads are capped in memory as they stream, so an oversized file is
-  abandoned without ever being fully buffered.
+- Media is intentionally dropped. If you need the bytes, this is the wrong tool — point a
+  real downloader at the same channels and join on message ID.
 - Deleted Discord messages leave orphaned `reply_to` IDs. Those references resolve to
   `null` rather than dropping the message.
 - Because the archive is a git repository, GitHub's hard size cap eventually applies to a

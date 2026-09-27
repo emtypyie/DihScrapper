@@ -1,10 +1,9 @@
 """Publish the local archive to the private GitHub data repository.
 
-Media is never written to disk. Attachments are uploaded straight into the archive
-repository as git blobs by :meth:`GitHubArchive.store_blob`, and the path-to-blob
-mapping is kept in ``HOME/.media-index.json`` so later commits can reference those
-blobs without ever holding the bytes locally. The local ``HOME`` tree therefore
-contains JSON only.
+Only JSON is ever archived. Media is not downloaded and not stored anywhere: the
+bot records an image attachment as the placeholder ``[potential image]`` in the
+transcript, so the local ``HOME`` tree and the remote archive contain nothing but
+text.
 
 Every commit is assembled through the git data API: blobs, then a tree layered on
 the current remote tree, then a commit, then a ref update. Files whose git blob hash
@@ -43,10 +42,8 @@ DATA_ROOT = Path(os.environ.get("DATA_ROOT", "HOME"))
 PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
 API_ROOT = "https://api.github.com"
 
-MEDIA_INDEX = ".media-index.json"
 BOOTSTRAP_FILE = ".archive"
 BOOTSTRAP_BODY = b"DihScrapper live archive. Managed automatically; do not edit.\n"
-EMPTY_REPO = "git repository is empty"
 FILE_MODE = "100644"
 
 
@@ -80,10 +77,6 @@ class GitHubArchive:
     def configured(self) -> bool:
         return bool(self.owner and self.repo and self.token)
 
-    @property
-    def index_path(self) -> Path:
-        return self.data_root / MEDIA_INDEX
-
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.token}",
@@ -91,6 +84,10 @@ class GitHubArchive:
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "DihScrapper",
         }
+
+    @staticmethod
+    def blob_sha(payload: bytes) -> str:
+        return git_blob_sha(payload)
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -124,55 +121,46 @@ class GitHubArchive:
     def _repo_path(self, suffix: str) -> str:
         return f"/repos/{self.owner}/{self.repo}{suffix}"
 
-    def load_media_index(self) -> dict[str, str]:
-        try:
-            with self.index_path.open(encoding="utf-8") as handle:
-                data = json.load(handle)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def save_media_index(self, index: dict[str, str]) -> None:
-        self.data_root.mkdir(parents=True, exist_ok=True)
-        staging = self.index_path.with_suffix(".tmp")
-        with staging.open("w", encoding="utf-8") as handle:
-            json.dump(index, handle, indent=1, sort_keys=True)
-        staging.replace(self.index_path)
-
-    async def store_blob(self, payload: bytes) -> str:
-        """Upload bytes into the archive repository and return the git blob hash.
-
-        GitHub rejects blob creation against a repository with no commits, so an
-        empty archive is bootstrapped with an initial commit first.
-        """
-        encoded = base64.b64encode(payload).decode()
-        try:
-            return await self._create_blob(encoded)
-        except ArchiveError as exc:
-            if EMPTY_REPO not in str(exc).lower():
-                raise
-        await self._bootstrap()
-        return await self._create_blob(encoded)
-
-    async def _create_blob(self, encoded: str) -> str:
-        result = await self._api(
-            "POST",
-            self._repo_path("/git/blobs"),
-            {"content": encoded, "encoding": "base64"},
-        )
-        return result["sha"]
-
     async def _bootstrap(self) -> None:
-        logger.info("Archive repository is empty; creating its initial commit")
-        await self._api(
-            "PUT",
-            self._repo_path(f"/contents/{BOOTSTRAP_FILE}"),
-            {
-                "message": "Initialise archive",
-                "content": base64.b64encode(BOOTSTRAP_BODY).decode(),
-                "branch": self.branch,
-            },
+        """Ensure the archive has a commit for the configured branch to build on.
+
+        Two distinct cases. A repository with no commits at all cannot accept
+        blobs, so it is seeded with a commit through the contents API -- that
+        request must omit ``branch``, because the API answers 404 for a branch
+        that does not exist yet rather than creating it. A repository that
+        already has commits only needs the configured branch pointed at the
+        default branch's head.
+        """
+        logger.info("Archive branch %s is absent; seeding it from the default branch", self.branch)
+        repo = await self._api("GET", self._repo_path(""), allow_missing=())
+        ref = await self._api(
+            "GET",
+            self._repo_path(f"/git/ref/heads/{repo['default_branch']}"),
+            allow_missing=(404, 409),
         )
+        if ref is not None:
+            seed = ref["object"]["sha"]
+        else:
+            result = await self._api(
+                "PUT",
+                self._repo_path(f"/contents/{BOOTSTRAP_FILE}"),
+                {
+                    "message": "Initialise archive",
+                    "content": base64.b64encode(BOOTSTRAP_BODY).decode(),
+                },
+                allow_missing=(),
+            )
+            seed = result["commit"]["sha"]
+        try:
+            await self._api(
+                "POST",
+                self._repo_path("/git/refs"),
+                {"ref": f"refs/heads/{self.branch}", "sha": seed},
+                allow_missing=(),
+            )
+        except ArchiveError as exc:
+            if "already exists" not in str(exc).lower():
+                raise
 
     async def _remote_state(self) -> tuple[str | None, str | None, dict[str, str]]:
         ref = await self._api(
@@ -215,14 +203,13 @@ class GitHubArchive:
         return payloads
 
     async def publish(self, dry_run: bool = False) -> bool:
-        """Commit local JSON plus indexed media blobs to the archive repository."""
+        """Commit the local JSON tree to the archive repository."""
         if not self.configured:
             logger.info("GitHub archive not configured; skipping publish")
             return False
 
         head_sha, tree_sha, remote_paths = await self._remote_state()
         payloads = self._local_payloads()
-        media = self.load_media_index()
 
         entries: list[dict] = []
         added: list[str] = []
@@ -234,18 +221,7 @@ class GitHubArchive:
             entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": blob})
             (added if path not in remote_paths else changed).append(path)
 
-        for path, blob in media.items():
-            if path in payloads or remote_paths.get(path) == blob:
-                continue
-            entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": blob})
-            (added if path not in remote_paths else changed).append(path)
-
-        keep = set(payloads) | set(media)
-        removed = [
-            path
-            for path in remote_paths
-            if path not in keep and not path.startswith(".")
-        ]
+        removed = [path for path in remote_paths if path not in payloads and not path.startswith(".")]
         for path in removed:
             entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": None})
 
@@ -264,6 +240,10 @@ class GitHubArchive:
             for path in removed[:20]:
                 logger.info("[dry-run] remove %s", path)
             return True
+
+        if head_sha is None:
+            await self._bootstrap()
+            head_sha, tree_sha, _ = await self._remote_state()
 
         await self._create_blobs(payloads, entries)
         new_tree = await self._api(
@@ -293,12 +273,21 @@ class GitHubArchive:
 
     async def _create_blobs(self, payloads: dict[str, bytes], entries: list[dict]) -> None:
         wanted = {
-            path: payload
-            for path, payload in payloads.items()
-            if any(e["path"] == path and e.get("sha") for e in entries)
+            path
+            for entry in entries
+            if entry.get("sha")
+            for path in (entry["path"],)
+            if path in payloads
         }
-        for path, payload in wanted.items():
-            await self.store_blob(payload)
+        for path in wanted:
+            await self._api(
+                "POST",
+                self._repo_path("/git/blobs"),
+                {
+                    "content": base64.b64encode(payloads[path]).decode(),
+                    "encoding": "base64",
+                },
+            )
 
     async def _write_ref(self, commit_sha: str, previous: str | None) -> None:
         if previous is None:

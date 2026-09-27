@@ -1,8 +1,8 @@
-"""DihScrapper — live Discord chat scraper and media archiver.
+"""DihScrapper — live Discord chat scraper.
 
-Captures messages as they arrive, stores the transcripts as JSON, and pushes media
-straight into the private archive repository as git blobs. Media is never written to
-the local filesystem.
+Captures messages as they arrive, stores the transcripts as JSON, and pushes them to the
+private archive repository. Media is never downloaded or stored: an image attachment is
+recorded as the placeholder "[potential image]".
 """
 
 from __future__ import annotations
@@ -15,11 +15,10 @@ import re
 import signal
 from pathlib import Path
 
-import aiohttp
 import discord
 from dotenv import load_dotenv
 
-from upload_data import ArchiveError, GitHubArchive
+from upload_data import GitHubArchive
 
 load_dotenv()
 
@@ -30,9 +29,8 @@ logging.basicConfig(
 logger = logging.getLogger("DihScrapper")
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "HOME"))
-MEDIA_MAX_SIZE = int(os.environ.get("MEDIA_MAX_SIZE", "25")) * 1024 * 1024
 PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
-CHUNK_SIZE = 64 * 1024
+IMAGE_PLACEHOLDER = "[potential image]"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -41,7 +39,6 @@ bot = discord.Client(intents=intents)
 
 archive = GitHubArchive(data_root=DATA_ROOT)
 _push_task: asyncio.Task[None] | None = None
-_media_index: dict[str, str] = {}
 
 _unsafe = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -110,56 +107,13 @@ async def fetch_reference(
         return None
 
 
-async def store_image(
-    session: aiohttp.ClientSession, attachment: discord.Attachment, guild: discord.Guild
-) -> str | None:
-    """Stream an attachment and commit it to the archive as a git blob.
-
-    Returns the archive-relative path, or None if the media could not be stored.
-    """
-    buffer = bytearray()
-    try:
-        async with session.get(attachment.url) as response:
-            if response.status != 200:
-                logger.warning("Media %s returned HTTP %s", attachment.id, response.status)
-                return None
-            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                buffer.extend(chunk)
-                if len(buffer) > MEDIA_MAX_SIZE:
-                    logger.warning(
-                        "Media %s exceeds the %d MiB cap; keeping the CDN URL",
-                        attachment.id, MEDIA_MAX_SIZE // 1024**2,
-                    )
-                    return None
-        relative = (
-            Path(sanitize(guild.name))
-            / "mediapool"
-            / f"{attachment.id}_{sanitize(attachment.filename)}"
-        ).as_posix()
-        blob = await archive.store_blob(bytes(buffer))
-        _media_index[relative] = blob
-        archive.save_media_index(_media_index)
-        return relative
-    except (aiohttp.ClientError, OSError, ArchiveError) as exc:
-        logger.warning("Failed to store media %s: %s", attachment.id, exc)
-        return None
-
-
 async def build_message(message: discord.Message) -> dict:
-    stored: list[str] = []
-    remote_only: list[str] = []
-
-    if message.attachments:
-        async with aiohttp.ClientSession() as session:
-            for attachment in message.attachments:
-                if not (attachment.content_type or "").startswith("image/"):
-                    remote_only.append(attachment.url)
-                    continue
-                path = await store_image(session, attachment, message.guild)
-                if path is None:
-                    remote_only.append(attachment.url)
-                else:
-                    stored.append(path)
+    attachments: list[str] = []
+    for attachment in message.attachments:
+        if (attachment.content_type or "").startswith("image/"):
+            attachments.append(IMAGE_PLACEHOLDER)
+        else:
+            attachments.append(attachment.url)
 
     reply_to = None
     if message.reference and message.reference.message_id:
@@ -172,18 +126,15 @@ async def build_message(message: discord.Message) -> dict:
                 "content_snippet": (parent.content or "")[:200],
             }
 
-    record: dict = {
+    return {
         "id": message.id,
         "timestamp": message.created_at.isoformat(),
         "author": message.author.global_name or message.author.name,
         "author_id": message.author.id,
         "content": message.content or "",
-        "attachments": stored,
+        "attachments": attachments,
         "reply_to": reply_to,
     }
-    if remote_only:
-        record["media_size_exceeded"] = remote_only
-    return record
 
 
 async def publish() -> None:
@@ -203,7 +154,6 @@ async def push_loop() -> None:
 @bot.event
 async def on_ready() -> None:
     global _push_task
-    _media_index.update(archive.load_media_index())
     logger.info("Authenticated as %s, listening for new messages", bot.user)
     if _push_task is None or _push_task.done():
         _push_task = asyncio.create_task(push_loop())

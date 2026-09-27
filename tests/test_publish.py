@@ -1,10 +1,12 @@
 """End-to-end check of the archive publisher.
 
-Runs against a unique throwaway branch so it is repeatable and never touches the
-live archive. Verifies that media reaches the git tree as a blob while no media
-bytes are ever written to the local filesystem, that a second publish of
-unchanged content is a no-op, and that an edited transcript produces exactly one
-new commit with the expected blob hash.
+Creates a throwaway private repository, publishes to it, and deletes it, so the
+test exercises the real first-run path (an archive with no commits at all)
+without ever touching the live archive repository or its default branch.
+
+Verifies that transcripts reach the git tree with correct blob hashes, that
+media is never committed, that a second publish of unchanged content is a
+no-op, and that an edited transcript produces exactly one new commit.
 
     python tests/test_publish.py
 """
@@ -12,42 +14,23 @@ new commit with the expected blob hash.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-import os
 import sys
 import tempfile
 import uuid
 from pathlib import Path
 
-import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from upload_data import GitHubArchive, git_blob_sha  # noqa: E402
+from upload_data import GitHubArchive  # noqa: E402
 
-PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmM"
-    "IQAAAABJRU5ErkJggg=="
-)
 TRANSCRIPT_PATH = "TestServer/general.json"
-MEDIA_PATH = "TestServer/mediapool/1_probe.png"
-
-
-async def delete_branch(archive: GitHubArchive) -> None:
-    try:
-        await archive._api(
-            "DELETE",
-            archive._repo_path(f"/git/refs/heads/{archive.branch}"),
-        )
-    except Exception:
-        pass
 
 
 async def scenario() -> int:
-    branch = f"selftest-{uuid.uuid4().hex[:12]}"
     failures: list[str] = []
 
     def check(label: str, condition: bool) -> None:
@@ -55,68 +38,83 @@ async def scenario() -> int:
         if not condition:
             failures.append(label)
 
-    with tempfile.TemporaryDirectory() as scratch:
-        root = Path(scratch) / "HOME"
-        archive = GitHubArchive(data_root=root, branch=branch)
+    probe = GitHubArchive()
+    if not probe.configured:
+        print("SKIP  GITHUB_TOKEN is not configured")
+        return 0
+
+    owner = (await probe._api("GET", "/user", allow_missing=()))["login"]
+    name = f"dihscrapper-test-{uuid.uuid4().hex[:8]}"
+    await probe._api(
+        "POST",
+        "/user/repos",
+        {"name": name, "private": True, "auto_init": False},
+        allow_missing=(),
+    )
+    await probe.close()
+
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch) / "HOME"
+            archive = GitHubArchive(data_root=root, owner=owner, repo=name, branch="main")
+            try:
+                head_before, _, _ = await archive._remote_state()
+                check("fresh repository has no commits", head_before is None)
+
+                transcript = [
+                    {
+                        "id": 1,
+                        "content": "hello",
+                        "attachments": ["[potential image]"],
+                        "reply_to": None,
+                    }
+                ]
+                (root / "TestServer").mkdir(parents=True, exist_ok=True)
+                transcript_file = root / "TestServer" / "general.json"
+                transcript_file.write_text(json.dumps(transcript), encoding="utf-8")
+
+                check("first publish bootstraps and commits", await archive.publish())
+
+                head_after, _, paths = await archive._remote_state()
+                check("branch head advanced", head_after is not None and head_after != head_before)
+                check("transcript present in tree", TRANSCRIPT_PATH in paths)
+                check(
+                    "transcript blob hash matches its local bytes",
+                    paths.get(TRANSCRIPT_PATH) == archive.blob_sha(transcript_file.read_bytes()),
+                )
+                check("no mediapool committed", not any("mediapool" in p for p in paths))
+                check("no local-only index committed", ".media-index.json" not in paths)
+                check(
+                    "nothing on disk but the transcript",
+                    sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+                    == [TRANSCRIPT_PATH],
+                )
+
+                check("republish of unchanged data is a no-op", not await archive.publish())
+
+                transcript.append(
+                    {"id": 2, "content": "second", "attachments": [], "reply_to": None}
+                )
+                transcript_file.write_text(json.dumps(transcript), encoding="utf-8")
+                check("edited transcript republishes", await archive.publish())
+
+                head_final, _, final_paths = await archive._remote_state()
+                check("exactly one further commit landed", head_final not in (head_before, head_after))
+                check("archive path set is unchanged by the edit", set(final_paths) == set(paths))
+                check(
+                    "edited transcript has the new blob hash",
+                    final_paths.get(TRANSCRIPT_PATH)
+                    == archive.blob_sha(transcript_file.read_bytes()),
+                )
+            finally:
+                await archive.close()
+    finally:
+        cleanup = GitHubArchive(owner=owner, repo=name)
         try:
-            head_before, _, _ = await archive._remote_state()
-            check("new branch starts with no commits", head_before is None)
-
-            blob_sha = await archive.store_blob(PNG)
-            check("store_blob returns a 40-char git hash", len(blob_sha) == 40)
-            check("store_blob hash is the real blob hash", blob_sha == git_blob_sha(PNG))
-
-            archive.save_media_index({MEDIA_PATH: blob_sha})
-            check(
-                "media index is written locally",
-                (root / ".media-index.json").is_file(),
-            )
-
-            transcript = [
-                {
-                    "id": 1,
-                    "content": "hello",
-                    "attachments": [MEDIA_PATH],
-                }
-            ]
-            (root / "TestServer").mkdir(parents=True, exist_ok=True)
-            transcript_file = root / "TestServer" / "general.json"
-            transcript_file.write_text(json.dumps(transcript), encoding="utf-8")
-
-            check("first publish commits", await archive.publish())
-
-            head_after, _, paths = await archive._remote_state()
-            check("branch head advanced", head_after is not None and head_after != head_before)
-            check("transcript present in tree", TRANSCRIPT_PATH in paths)
-            check("media blob present in tree", MEDIA_PATH in paths)
-            check("media blob hash round-trips", paths.get(MEDIA_PATH) == blob_sha)
-            check(
-                "transcript blob hash matches its local bytes",
-                paths.get(TRANSCRIPT_PATH)
-                == git_blob_sha(transcript_file.read_bytes()),
-            )
-            check("local media index is not published", ".media-index.json" not in paths)
-            check(
-                "no media bytes were written to disk",
-                not (root / "TestServer" / "mediapool").exists(),
-            )
-
-            check("republish of unchanged data is a no-op", not await archive.publish())
-
-            transcript.append({"id": 2, "content": "second"})
-            transcript_file.write_text(json.dumps(transcript), encoding="utf-8")
-            check("edited transcript republishes", await archive.publish())
-
-            head_final, _, final_paths = await archive._remote_state()
-            check("exactly one further commit landed", head_final not in (head_before, head_after))
-            check("archive path set is unchanged by the edit", set(final_paths) == set(paths))
-            check(
-                "edited transcript has the new blob hash",
-                final_paths.get(TRANSCRIPT_PATH) == git_blob_sha(transcript_file.read_bytes()),
-            )
+            await cleanup._api("DELETE", f"/repos/{owner}/{name}", allow_missing=())
+            print("cleaned up throwaway repository")
         finally:
-            await delete_branch(archive)
-            await archive.close()
+            await cleanup.close()
 
     print()
     if failures:

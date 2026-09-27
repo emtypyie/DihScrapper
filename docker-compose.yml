@@ -14,7 +14,6 @@ services:
       GITHUB_BRANCH: ${GITHUB_BRANCH:-main}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       DISCORD_API: ${DISCORD_API}
-      MEDIA_MAX_SIZE: 25
       PUSH_INTERVAL: 300
     volumes:
       - home:/app/HOME
