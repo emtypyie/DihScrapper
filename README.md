@@ -17,11 +17,11 @@ Three properties shape the design:
 
 - **It captures the live stream only.** There is no backfill. Nothing that was said before
   the bot connected is ever read. The archive begins when the bot starts.
-- **Media is never stored.** Attachments are not downloaded at all. An image is recorded
-  as the literal string `[potential image]`, so the archive stays pure text and the scraper
-  stays cheap to run.
-- **Text only, no binaries.** Every file in the archive is a small JSON document. There are
-  no images, videos, or blobs to bloat the repository.
+- **Media is recorded by reference, never downloaded.** Images, videos, and files are all
+  stored as their CDN URL. Nothing is fetched, and nothing but a URL is kept.
+- **The archive is append-only.** Every cycle appends newly captured messages, verifies they
+  landed, and only then clears the local buffer. Nothing in the archive is ever rewritten
+  or deleted, so the local disk is disposable staging and the repository is the record.
 
 Because the archive lives in Git, the scraper can be killed, redeployed, or moved to
 another host and pick up exactly where it left off.
@@ -32,43 +32,44 @@ The bot runs a single event loop over the channels it has been invited to.
 
 1. **Listen.** `on_message` fires for every new message. Messages authored by the bot
    itself are dropped so it never archives its own output.
-2. **Build a record.** Each message becomes one JSON object: snowflake ID, ISO timestamp,
-   author name and ID, content, an `attachments` list, and a `reply_to` block when the
-   message answers another.
-3. **Note attachments, not bytes.** An image attachment contributes the placeholder
-   `[potential image]` to `attachments`. Any other kind of file contributes its CDN URL, so
-   the reference survives even though the bytes were never fetched.
-4. **Track the directory.** Each server keeps a `user_map.json` of `username → user_id`, so
-   author names stay resolvable to stable identities after display names change.
-5. **Publish.** Every `PUSH_INTERVAL` seconds the local JSON is committed to the archive
-   repository.
+2. **Buffer a row.** Each message becomes one CSV row appended to that channel's local
+   buffer: snowflake ID, ISO timestamp, author name and ID, content, the space-separated
+   attachment URLs, and four `reply_to_*` columns when the message answers another.
+3. **Track the directory.** Each server keeps a `user_map.csv` of `username,user_id`, keyed
+   by ID so a renamed user keeps their history.
+4. **Push, verify, clear.** Every `PUSH_INTERVAL` seconds the buffer is appended to the
+   archive, read back to confirm, and only then cleared.
 
-Transcript writes are atomic — staged to a temporary file and renamed into place — so a
-crash mid-write cannot leave a half-written log behind.
+Rows are keyed on message ID throughout, so the whole cycle is idempotent: a retry after a
+failed push re-appends the same rows and changes nothing.
+
+## The publish cycle
+
+Each interval runs three steps, and the third is gated on the second.
+
+1. **Append.** For every local CSV, read the published copy from the archive, drop any row
+   whose key is already there, sort by ID, and commit the result as one tree and one
+   commit. No deletion entry is ever emitted, so the archive can only grow.
+2. **Verify.** Re-read the archive from GitHub and confirm every key just committed is
+   actually present. Anything missing aborts the cycle.
+3. **Clear.** Remove exactly the rows that were confirmed, by key. A message that arrives
+   mid-cycle is therefore not lost — it is simply not in the cleared set and goes out on
+   the next interval.
+
+If step 1 or 2 fails the buffer is left completely intact and the next interval retries.
 
 ## Publishing model
 
-The archive is written through the GitHub git data API rather than a local git worktree. A
-publish run:
-
-1. Reads the current branch ref and walks the remote tree to learn every tracked path and
-   its blob hash.
-2. Hashes each local file the same way git does. Files whose hash already matches the
-   remote are skipped, so a steady-state sync costs two API calls no matter how large the
-   archive grows.
-3. Uploads blobs for anything new or changed.
-4. Posts a tree layered on the current remote tree, then a commit, then a ref update.
-
-Because the local `HOME` tree is treated as the source of truth, a path that disappears
-locally is deleted from the archive on the next publish.
+Commits are assembled through the GitHub git data API: blobs, then a tree layered on the
+current remote tree, then a commit, then a ref update. Files are hashed the way git hashes
+them, so unchanged content is skipped and a steady-state cycle costs a couple of API calls
+no matter how large the archive grows.
 
 ### Starting from an empty repository
 
 GitHub will not create a blob in a repository that has no commits, so a brand-new archive
-is seeded before its first publish. If the repository already has commits but the
-configured branch does not, the branch is simply pointed at the default branch's head. If
-there are no commits at all, a seed file is committed through the contents API first, and
-only then are blobs created.
+is seeded before its first append. If the repository already has commits but the configured
+branch does not, the branch is pointed at the default branch's head instead.
 
 ## Data layout
 
@@ -76,49 +77,38 @@ In the archive repository:
 
 ```text
 TestServer/
-├── general.json
-└── user_map.json
+├── general.csv
+└── user_map.csv
 ```
 
 Server and channel names are stripped to `[A-Za-z0-9_-]` and capped at 64 characters.
 
-Locally, the same layout minus the repository:
+Locally, the same layout, holding only unsent rows:
 
 ```text
 HOME/
 └── [Sanitized_Server_Name]/
-    ├── [Sanitized_Channel_Name].json
-    └── user_map.json
+    ├── [Sanitized_Channel_Name].csv
+    └── user_map.csv
 ```
 
-Each entry in a channel transcript:
+A channel transcript row:
 
-```json
-{
-  "id": 1234567890,
-  "timestamp": "2026-09-27T20:18:00+00:00",
-  "author": "username_here",
-  "author_id": 9876543210,
-  "content": "Message string text here",
-  "attachments": ["[potential image]"],
-  "reply_to": {
-    "message_id": 1122334455,
-    "author_id": 5544332211,
-    "author_username": "original_poster",
-    "content_snippet": "This was the text being replied to..."
-  }
-}
+```csv
+id,timestamp,author,author_id,content,attachments,reply_to_id,reply_to_author_id,reply_to_author,reply_to_content
+1234567890,2026-09-27T20:18:00+00:00,username_here,9876543210,"Message string, with a comma","https://cdn.discordapp.com/attachments/1/2/pic.png https://cdn.discordapp.com/attachments/1/3/clip.mp4",1122334455,5544332211,original_poster,"This was the text being replied to..."
 ```
 
-`attachments` is always present and is empty when the message had none. `[potential image]`
-is a fixed marker, not a path — nothing is fetched behind it.
+`attachments` is a space-separated list of CDN URLs — images, videos, and files alike. It
+is empty when the message had none. The four `reply_to_*` columns are empty when the message
+was not a reply.
 
 ## Repositories
 
 | Repository | Visibility | Contents |
 | --- | --- | --- |
 | `DihScrapper` | Public | This code. `HOME/` is gitignored and never enters it. |
-| `ScrapedDih` | Private | The archive. JSON transcripts only. |
+| `ScrapedDih` | Private | The archive. CSV transcripts and user maps. |
 
 `HOME/` belongs exclusively to the private archive and is gitignored in the code repo.
 The code lives on the main account; the archive lives on whichever account `GITHUB_OWNER`
@@ -185,16 +175,13 @@ than the interval still leaves its messages in the archive.
 ## Publishing on demand
 
 ```bash
-python upload_data.py             # publish once, then exit
-python upload_data.py --dry-run   # show what would change
+python upload_data.py             # append, verify, clear, then exit
+python upload_data.py --dry-run   # show what would be appended
 ```
 
-`--dry-run` reports pending additions, updates, and removals without committing.
-
-Run this **inside the container**, or against the same `DATA_ROOT` that holds the
-transcripts. The local tree is authoritative, so publishing from a machine with an empty
-one looks exactly like a wipe. That case is refused with a non-zero exit; `--allow-empty`
-overrides it if a wipe is genuinely what you want:
+Safe to run from anywhere: publishing only ever appends, so an empty local buffer cannot
+damage the archive. It still needs to point at the same `DATA_ROOT` holding the unsent
+rows, so from the container that is:
 
 ```bash
 docker compose exec dihscrapper python upload_data.py
@@ -206,18 +193,19 @@ docker compose exec dihscrapper python upload_data.py
 python tests/test_publish.py
 ```
 
-Creates a throwaway private repository, publishes to it, asserts the transcript reaches the
-tree with the correct blob hash, that no media or local bookkeeping file is committed, that
-unchanged data is a no-op, and that an edited transcript produces exactly one new commit.
-The repository is deleted afterwards, so the live archive is never touched.
+Creates a throwaway private repository and drives the real append → verify → clear cycle
+against it, asserting that image and video attachments are stored as their URLs, that
+nothing is ever deleted, that a row arriving mid-publish survives the clear, and that a
+re-push of identical rows is a no-op. The repository is deleted afterwards, so the live
+archive is never touched.
 
 ## Notes
 
 - The bot archives only channels it can read, and only from the moment it connects.
-- Media is intentionally dropped. If you need the bytes, this is the wrong tool — point a
-  real downloader at the same channels and join on message ID.
-- Deleted Discord messages leave orphaned `reply_to` IDs. Those references resolve to
-  `null` rather than dropping the message.
+- Media is intentionally not downloaded. If you need the bytes, this is the wrong tool —
+  point a real downloader at the same channels and join on message ID.
+- Deleted Discord messages leave orphaned `reply_to_id` values, since the parent can no
+  longer be fetched. The row is still kept.
 - Because the archive is a git repository, GitHub's hard size cap eventually applies to a
   long-lived deployment of a busy server. A retention policy or a larger host is the
   remedy.

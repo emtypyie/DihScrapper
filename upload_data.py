@@ -1,19 +1,19 @@
-"""Publish the local archive to the private GitHub data repository.
+"""Append the local buffer to the private GitHub data repository.
 
-Only JSON is ever archived. Media is not downloaded and not stored anywhere: the
-bot records an image attachment as the placeholder ``[potential image]`` in the
-transcript, so the local ``HOME`` tree and the remote archive contain nothing but
-text.
+Publishing is strictly append-only. Buffered CSV rows are merged into the
+remote copy keyed on message id, a single commit is made, and no path is ever
+deleted. An empty local buffer therefore cannot damage the archive, which is
+what lets the bot treat its local tree as disposable staging.
 
-Every commit is assembled through the git data API: blobs, then a tree layered on
-the current remote tree, then a commit, then a ref update. Files whose git blob hash
-already matches the remote are skipped, so a steady-state sync costs two API calls
-regardless of archive size.
+Each commit is assembled through the git data API: blobs, then a tree layered on
+the current remote tree, then a commit, then a ref update. Files whose git blob
+hash already matches the remote are skipped, so a steady-state sync costs two
+API calls regardless of archive size.
 
 Usable as a library from ``main.py`` or standalone::
 
-    python upload_data.py            # publish once, then exit
-    python upload_data.py --dry-run  # report what would change
+    python upload_data.py            # append, verify, then clear, and exit
+    python upload_data.py --dry-run  # report what would be appended
 """
 
 from __future__ import annotations
@@ -25,10 +25,22 @@ import hashlib
 import json
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
+
+from archive_format import (
+    MESSAGE_FIELDS,
+    MESSAGE_KEY,
+    USER_FIELDS,
+    USER_KEY,
+    dump_csv,
+    load_csv,
+    read_rows,
+    rewrite,
+)
 
 load_dotenv()
 
@@ -45,6 +57,25 @@ API_ROOT = "https://api.github.com"
 BOOTSTRAP_FILE = ".archive"
 BOOTSTRAP_BODY = b"DihScrapper live archive. Managed automatically; do not edit.\n"
 FILE_MODE = "100644"
+USER_MAP_FILE = "user_map.csv"
+
+
+@dataclass(frozen=True)
+class CsvSpec:
+    fields: list[str]
+    key: str
+
+
+_MESSAGE_SPEC = CsvSpec(MESSAGE_FIELDS, MESSAGE_KEY)
+_USER_SPEC = CsvSpec(USER_FIELDS, USER_KEY)
+
+
+def _sort_key(value: str) -> tuple[int, int, str]:
+    """Sort snowflakes and user ids numerically, tolerating non-numeric input."""
+    try:
+        return (0, int(value), "")
+    except (TypeError, ValueError):
+        return (1, 0, str(value))
 
 
 class ArchiveError(RuntimeError):
@@ -202,106 +233,162 @@ class GitHubArchive:
             payloads[relative] = path.read_bytes()
         return payloads
 
-    async def publish(self, dry_run: bool = False, allow_empty: bool = False) -> bool:
-        """Commit the local JSON tree to the archive repository.
+    @staticmethod
+    def _spec_for(path: str):
+        """Resolve the CSV schema for an archive path, or None if it is not CSV."""
+        if not path.endswith(".csv"):
+            return None
+        if path.rsplit("/", 1)[-1] == USER_MAP_FILE:
+            return _USER_SPEC
+        return _MESSAGE_SPEC
 
-        The local tree is authoritative, so a path that vanishes locally is
-        deleted remotely. That makes an empty local tree indistinguishable from a
-        wiped one, which is exactly what happens when publishing is run outside
-        the container that holds the volume -- so an empty local tree against a
-        non-empty archive is refused unless ``allow_empty`` is set.
+    async def _read_remote_rows(
+        self, path: str, blob_sha: str | None, fields: list[str]
+    ) -> list[dict[str, str]]:
+        """Fetch and parse an already-published CSV so new rows can be merged into it."""
+        if not blob_sha:
+            return []
+        blob = await self._api("GET", self._repo_path(f"/git/blobs/{blob_sha}"))
+        return load_csv(base64.b64decode(blob["content"]), fields)
+
+    async def publish(self, dry_run: bool = False) -> dict[str, list[str]]:
+        """Append buffered rows to the archive, returning the keys committed.
+
+        Strictly append-only. Rows already present remotely are skipped, and no
+        path is ever deleted, so a publish can only ever grow the archive. That
+        also removes the hazard of publishing from a machine with no local data:
+        there is nothing for an empty buffer to destroy.
         """
         if not self.configured:
             logger.info("GitHub archive not configured; skipping publish")
-            return False
+            return {}
 
         head_sha, tree_sha, remote_paths = await self._remote_state()
         payloads = self._local_payloads()
 
-        if not payloads and remote_paths and not allow_empty:
-            raise ArchiveError(
-                f"local archive at {self.data_root} is empty but {self.owner}/{self.repo} "
-                f"tracks {len(remote_paths)} file(s); refusing to delete them. Publish from the "
-                "container that holds the volume, or pass allow_empty to override."
-            )
-
         entries: list[dict] = []
-        added: list[str] = []
-        changed: list[str] = []
+        blobs: dict[str, bytes] = {}
+        published: dict[str, list[str]] = {}
         for path, payload in payloads.items():
-            blob = git_blob_sha(payload)
-            if remote_paths.get(path) == blob:
+            spec = self._spec_for(path)
+            if spec is None:
                 continue
-            entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": blob})
-            (added if path not in remote_paths else changed).append(path)
+            local_rows = load_csv(payload, spec.fields)
+            if not local_rows:
+                continue
 
-        removed = [path for path in remote_paths if path not in payloads and not path.startswith(".")]
-        for path in removed:
-            entries.append({"path": path, "mode": FILE_MODE, "type": "blob", "sha": None})
+            remote_rows = await self._read_remote_rows(path, remote_paths.get(path), spec.fields)
+            merged = {row[spec.key]: row for row in remote_rows}
+            fresh: list[dict[str, str]] = []
+            for row in local_rows:
+                key = row[spec.key]
+                if key in merged:
+                    continue
+                merged[key] = row
+                fresh.append(row)
+            if not fresh:
+                continue
+
+            combined = sorted(merged.values(), key=lambda r: _sort_key(r[spec.key]))
+            content = dump_csv(spec.fields, combined)
+            blobs[path] = content
+            entries.append(
+                {
+                    "path": path,
+                    "mode": FILE_MODE,
+                    "type": "blob",
+                    "sha": git_blob_sha(content),
+                }
+            )
+            published[path] = [row[spec.key] for row in fresh]
 
         if not entries:
-            logger.info("Archive already up to date (%d file(s) tracked)", len(remote_paths))
-            return False
+            logger.info("Nothing new to append to %s/%s", self.owner, self.repo)
+            return {}
 
         if dry_run:
-            logger.info(
-                "[dry-run] +%d ~%d -%d", len(added), len(changed), len(removed)
-            )
-            for path in added[:20]:
-                logger.info("[dry-run] add    %s", path)
-            for path in changed[:20]:
-                logger.info("[dry-run] update %s", path)
-            for path in removed[:20]:
-                logger.info("[dry-run] remove %s", path)
-            return True
+            for path, keys in published.items():
+                logger.info("[dry-run] append %d row(s) to %s", len(keys), path)
+            return published
 
         if head_sha is None:
             await self._bootstrap()
             head_sha, tree_sha, _ = await self._remote_state()
 
-        await self._create_blobs(payloads, entries)
-        new_tree = await self._api(
-            "POST",
-            self._repo_path("/git/trees"),
-            {
-                "base_tree": tree_sha,
-                "tree": entries,
-            } if tree_sha else {"tree": entries},
-        )
-        parents = [head_sha] if head_sha else []
-        commit = await self._api(
-            "POST",
-            self._repo_path("/git/commits"),
-            {
-                "message": f"Archive sync: +{len(added)} ~{len(changed)} -{len(removed)}",
-                "tree": new_tree["sha"],
-                "parents": parents,
-            },
-        )
-        await self._write_ref(commit["sha"], head_sha)
-        logger.info(
-            "Published archive to %s/%s@%s (+%d ~%d -%d)",
-            self.owner, self.repo, self.branch, len(added), len(changed), len(removed),
-        )
-        return True
-
-    async def _create_blobs(self, payloads: dict[str, bytes], entries: list[dict]) -> None:
-        wanted = {
-            path
-            for entry in entries
-            if entry.get("sha")
-            for path in (entry["path"],)
-            if path in payloads
-        }
-        for path in wanted:
+        for path, content in blobs.items():
             await self._api(
                 "POST",
                 self._repo_path("/git/blobs"),
                 {
-                    "content": base64.b64encode(payloads[path]).decode(),
+                    "content": base64.b64encode(content).decode(),
                     "encoding": "base64",
                 },
             )
+
+        new_tree = await self._api(
+            "POST",
+            self._repo_path("/git/trees"),
+            {"base_tree": tree_sha, "tree": entries} if tree_sha else {"tree": entries},
+        )
+        commit = await self._api(
+            "POST",
+            self._repo_path("/git/commits"),
+            {
+                "message": self._commit_message(published),
+                "tree": new_tree["sha"],
+                "parents": [head_sha] if head_sha else [],
+            },
+        )
+        await self._write_ref(commit["sha"], head_sha)
+        logger.info(
+            "Appended %d row(s) across %d file(s) to %s/%s@%s",
+            sum(len(v) for v in published.values()),
+            len(published),
+            self.owner,
+            self.repo,
+            self.branch,
+        )
+        return published
+
+    async def verify(self, published: dict[str, list[str]]) -> list[str]:
+        """Re-read the archive and report any pushed key that is not there.
+
+        An empty return means every committed row is readable from the remote,
+        which is what gates clearing the local buffer.
+        """
+        _, _, remote_paths = await self._remote_state()
+        missing: list[str] = []
+        for path, keys in published.items():
+            spec = self._spec_for(path)
+            if spec is None:
+                continue
+            rows = await self._read_remote_rows(path, remote_paths.get(path), spec.fields)
+            present = {row[spec.key] for row in rows}
+            missing.extend(f"{path}:{key}" for key in keys if key not in present)
+        return missing
+
+    def clear_published(self, published: dict[str, list[str]]) -> None:
+        """Drop just the rows that were confirmed in the archive.
+
+        Removing by key rather than truncating the file means a message that
+        arrives mid-publish is preserved for the next cycle.
+        """
+        for path, keys in published.items():
+            spec = self._spec_for(path)
+            if spec is None:
+                continue
+            target = self.data_root / path
+            settled = set(keys)
+            rewrite(
+                target,
+                spec.fields,
+                [row for row in read_rows(target, spec.fields) if row[spec.key] not in settled],
+            )
+
+    @staticmethod
+    def _commit_message(published: dict[str, list[str]]) -> str:
+        total = sum(len(keys) for keys in published.values())
+        return f"Append {total} row(s) across {len(published)} file(s)"
 
     async def _write_ref(self, commit_sha: str, previous: str | None) -> None:
         if previous is None:
@@ -325,7 +412,22 @@ class GitHubArchive:
 async def _run(args: argparse.Namespace) -> None:
     archive = GitHubArchive()
     try:
-        await archive.publish(dry_run=args.dry_run, allow_empty=args.allow_empty)
+        published = await archive.publish(dry_run=args.dry_run)
+        total = sum(len(keys) for keys in published.values())
+        if args.dry_run:
+            logger.info("[dry-run] %d row(s) would be appended", total)
+            return
+        if not published:
+            logger.info("Nothing new to push")
+            return
+        missing = await archive.verify(published)
+        if missing:
+            raise ArchiveError(
+                f"{len(missing)} row(s) missing from the archive after push, "
+                f"local buffer left intact: {missing[:5]}"
+            )
+        archive.clear_published(published)
+        logger.info("Appended and verified %d row(s); local buffer cleared", total)
     except ArchiveError as exc:
         logger.error("Publish failed: %s", exc)
         raise SystemExit(1) from exc
@@ -338,13 +440,10 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    parser = argparse.ArgumentParser(description="Publish the archive to GitHub.")
-    parser.add_argument("--dry-run", action="store_true", help="report without committing")
-    parser.add_argument(
-        "--allow-empty",
-        action="store_true",
-        help="publish even when the local tree is empty, which deletes the remote archive",
+    parser = argparse.ArgumentParser(
+        description="Append the local buffer to the archive. Never deletes."
     )
+    parser.add_argument("--dry-run", action="store_true", help="report without committing")
     args = parser.parse_args()
     asyncio.run(_run(args))
 

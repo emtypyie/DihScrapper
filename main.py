@@ -1,14 +1,16 @@
 """DihScrapper — live Discord chat scraper.
 
-Captures messages as they arrive, stores the transcripts as JSON, and pushes them to the
-private archive repository. Media is never downloaded or stored: an image attachment is
-recorded as the placeholder "[potential image]".
+Captures messages as they arrive and buffers them as CSV. Every PUSH_INTERVAL
+seconds the buffer is appended to the private archive repository, verified, and
+only then cleared, so the archive is the durable record and the local disk stays
+transient.
+
+Media is never downloaded. Every attachment is recorded by its CDN URL.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -18,6 +20,14 @@ from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
+from archive_format import (
+    MESSAGE_FIELDS,
+    USER_FIELDS,
+    append_row,
+    message_row,
+    read_rows,
+    rewrite,
+)
 from upload_data import GitHubArchive
 
 load_dotenv()
@@ -30,7 +40,6 @@ logger = logging.getLogger("DihScrapper")
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "HOME"))
 PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
-IMAGE_PLACEHOLDER = "[potential image]"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -39,6 +48,10 @@ bot = discord.Client(intents=intents)
 
 archive = GitHubArchive(data_root=DATA_ROOT)
 _push_task: asyncio.Task[None] | None = None
+
+# on_message and the publish cycle both touch the same files, so every mutation
+# of the local buffer is serialised.
+_buffer_lock = asyncio.Lock()
 
 _unsafe = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -52,47 +65,25 @@ def server_dir(guild: discord.Guild) -> Path:
 
 
 def channel_path(channel: discord.TextChannel) -> Path:
-    return server_dir(channel.guild) / f"{sanitize(channel.name)}.json"
+    return server_dir(channel.guild) / f"{sanitize(channel.name)}.csv"
 
 
 def user_map_path(guild: discord.Guild) -> Path:
-    return server_dir(guild) / "user_map.json"
-
-
-def load_messages(path: Path) -> list[dict]:
-    if not path.exists():
-        return []
-    try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Could not read %s (%s); starting a fresh log", path, exc)
-        return []
-    return data if isinstance(data, list) else []
-
-
-def write_json(path: Path, payload: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.with_name(path.name + ".tmp")
-    with staging.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
-    staging.replace(path)
+    return server_dir(guild) / "user_map.csv"
 
 
 def record_users(guild: discord.Guild, messages: list[dict]) -> None:
+    """Upsert authors into the server's user directory, keyed by user id."""
     path = user_map_path(guild)
-    try:
-        with path.open(encoding="utf-8") as handle:
-            users = json.load(handle)
-        if not isinstance(users, dict):
-            users = {}
-    except (json.JSONDecodeError, OSError):
-        users = {}
+    rows = {row["user_id"]: row for row in read_rows(path, USER_FIELDS)}
     for message in messages:
         name = message.get("author")
         if name:
-            users[name] = str(message.get("author_id"))
-    write_json(path, users)
+            rows[str(message["author_id"])] = {
+                "username": str(name),
+                "user_id": str(message["author_id"]),
+            }
+    rewrite(path, USER_FIELDS, sorted(rows.values(), key=lambda r: r["username"].lower()))
 
 
 async def fetch_reference(
@@ -108,12 +99,9 @@ async def fetch_reference(
 
 
 async def build_message(message: discord.Message) -> dict:
-    attachments: list[str] = []
-    for attachment in message.attachments:
-        if (attachment.content_type or "").startswith("image/"):
-            attachments.append(IMAGE_PLACEHOLDER)
-        else:
-            attachments.append(attachment.url)
+    # Media is recorded by reference only: nothing is downloaded, and images,
+    # videos and files alike keep their CDN URL.
+    attachments = [attachment.url for attachment in message.attachments]
 
     reply_to = None
     if message.reference and message.reference.message_id:
@@ -137,17 +125,44 @@ async def build_message(message: discord.Message) -> dict:
     }
 
 
-async def publish() -> None:
-    try:
-        await archive.publish()
-    except Exception as exc:
-        logger.error("Archive publish failed: %s", exc)
+async def push_once() -> None:
+    """One cycle: append the buffer to the archive, verify, then clear it.
+
+    The clear is gated on verification, so a failed or partial push leaves the
+    buffer intact and the next cycle retries the same rows. Because the merge is
+    keyed on message id, a retry is idempotent even if the commit landed.
+    """
+    async with _buffer_lock:
+        try:
+            published = await archive.publish()
+        except Exception as exc:
+            logger.error("Archive publish failed: %s", exc)
+            return
+        if not published:
+            logger.info("Nothing new to push")
+            return
+
+        total = sum(len(ids) for ids in published.values())
+        try:
+            missing = await archive.verify(published)
+        except Exception as exc:
+            logger.error("Archive verify failed, keeping local buffer: %s", exc)
+            return
+        if missing:
+            logger.error(
+                "Archive is missing %d message(s) after push, keeping local buffer",
+                len(missing),
+            )
+            return
+
+        await archive.clear_published(published)
+        logger.info("Pushed and verified %d message(s); local buffer cleared", total)
 
 
 async def push_loop() -> None:
     await bot.wait_until_ready()
     while True:
-        await publish()
+        await push_once()
         await asyncio.sleep(PUSH_INTERVAL)
 
 
@@ -170,21 +185,11 @@ async def on_message(message: discord.Message) -> None:
         print("Makima is Listening :3")
 
     record = await build_message(message)
-    path = channel_path(message.channel)
-    write_json(path, merge_messages(load_messages(path), [record]))
-    record_users(message.guild, [record])
-    logger.debug("Archived message %s from #%s", message.id, message.channel.name)
-
-
-def merge_messages(existing: list[dict], incoming: list[dict]) -> list[dict]:
-    known = {m.get("id") for m in existing}
-    merged = list(existing)
-    for message in incoming:
-        if message.get("id") not in known:
-            merged.append(message)
-            known.add(message.get("id"))
-    merged.sort(key=lambda m: m.get("id", 0))
-    return merged
+    row = message_row(record)
+    async with _buffer_lock:
+        append_row(channel_path(message.channel), MESSAGE_FIELDS, row)
+        record_users(message.guild, [record])
+    logger.debug("Buffered message %s from #%s", message.id, message.channel.name)
 
 
 async def wait_for_shutdown(stop: asyncio.Event) -> None:

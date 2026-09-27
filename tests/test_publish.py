@@ -1,12 +1,13 @@
-"""End-to-end check of the archive publisher.
+"""End-to-end check of the append-only archive publisher.
 
-Creates a throwaway private repository, publishes to it, and deletes it, so the
-test exercises the real first-run path (an archive with no commits at all)
-without ever touching the live archive repository or its default branch.
+Creates a throwaway private repository, drives the real publish -> verify ->
+clear cycle against it, and deletes it, so the test never touches the live
+archive or its default branch.
 
-Verifies that transcripts reach the git tree with correct blob hashes, that
-media is never committed, that a second publish of unchanged content is a
-no-op, and that an edited transcript produces exactly one new commit.
+Covers the properties the bot depends on: a fresh archive bootstraps, buffered
+rows are appended, nothing is ever deleted, the buffer is only cleared once the
+rows are confirmed readable from the remote, a message arriving mid-publish
+survives the clear, and a re-push of identical rows is a no-op.
 
     python tests/test_publish.py
 """
@@ -14,7 +15,7 @@ no-op, and that an edited transcript produces exactly one new commit.
 from __future__ import annotations
 
 import asyncio
-import json
+import base64
 import sys
 import tempfile
 import uuid
@@ -25,9 +26,34 @@ from dotenv import load_dotenv
 load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from archive_format import (  # noqa: E402
+    MESSAGE_FIELDS,
+    MESSAGE_KEY,
+    USER_FIELDS,
+    append_row,
+    load_csv,
+    message_row,
+    read_rows,
+)
 from upload_data import GitHubArchive  # noqa: E402
 
-TRANSCRIPT_PATH = "TestServer/general.json"
+TRANSCRIPT = "TestServer/general.csv"
+USER_MAP = "TestServer/user_map.csv"
+IMAGE = "https://cdn.discordapp.com/attachments/1/2/pic.png"
+VIDEO = "https://cdn.discordapp.com/attachments/1/3/clip.mp4"
+
+
+def record(msg_id: int, content: str, attachments: list[str] | None = None,
+           reply: dict | None = None) -> dict:
+    return {
+        "id": msg_id,
+        "timestamp": "2026-09-27T20:00:00+00:00",
+        "author": f"user{msg_id}",
+        "author_id": 1000 + msg_id,
+        "content": content,
+        "attachments": attachments or [],
+        "reply_to": reply,
+    }
 
 
 async def scenario() -> int:
@@ -46,8 +72,7 @@ async def scenario() -> int:
     owner = (await probe._api("GET", "/user", allow_missing=()))["login"]
     name = f"dihscrapper-test-{uuid.uuid4().hex[:8]}"
     await probe._api(
-        "POST",
-        "/user/repos",
+        "POST", "/user/repos",
         {"name": name, "private": True, "auto_init": False},
         allow_missing=(),
     )
@@ -58,54 +83,87 @@ async def scenario() -> int:
             root = Path(scratch) / "HOME"
             archive = GitHubArchive(data_root=root, owner=owner, repo=name, branch="main")
             try:
-                head_before, _, _ = await archive._remote_state()
-                check("fresh repository has no commits", head_before is None)
+                head, _, _ = await archive._remote_state()
+                check("fresh repository has no commits", head is None)
 
-                transcript = [
-                    {
-                        "id": 1,
-                        "content": "hello",
-                        "attachments": ["[potential image]"],
-                        "reply_to": None,
-                    }
-                ]
                 (root / "TestServer").mkdir(parents=True, exist_ok=True)
-                transcript_file = root / "TestServer" / "general.json"
-                transcript_file.write_text(json.dumps(transcript), encoding="utf-8")
-
-                check("first publish bootstraps and commits", await archive.publish())
-
-                head_after, _, paths = await archive._remote_state()
-                check("branch head advanced", head_after is not None and head_after != head_before)
-                check("transcript present in tree", TRANSCRIPT_PATH in paths)
-                check(
-                    "transcript blob hash matches its local bytes",
-                    paths.get(TRANSCRIPT_PATH) == archive.blob_sha(transcript_file.read_bytes()),
+                append_row(
+                    root / "TestServer" / "general.csv",
+                    MESSAGE_FIELDS,
+                    message_row(record(1, "hello", [IMAGE])),
                 )
-                check("no mediapool committed", not any("mediapool" in p for p in paths))
-                check("no local-only index committed", ".media-index.json" not in paths)
-                check(
-                    "nothing on disk but the transcript",
-                    sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
-                    == [TRANSCRIPT_PATH],
+                append_row(
+                    root / "TestServer" / "general.csv",
+                    MESSAGE_FIELDS,
+                    message_row(record(2, "a video", [VIDEO])),
+                )
+                append_row(
+                    root / "TestServer" / "user_map.csv",
+                    USER_FIELDS,
+                    {"username": "user1", "user_id": "1001"},
                 )
 
-                check("republish of unchanged data is a no-op", not await archive.publish())
+                published = await archive.publish()
+                check("publish reports the pushed keys", set(published) == {TRANSCRIPT, USER_MAP})
+                check("publish returns every message id", sorted(published[TRANSCRIPT]) == ["1", "2"])
 
-                transcript.append(
-                    {"id": 2, "content": "second", "attachments": [], "reply_to": None}
-                )
-                transcript_file.write_text(json.dumps(transcript), encoding="utf-8")
-                check("edited transcript republishes", await archive.publish())
+                missing = await archive.verify(published)
+                check("verify finds nothing missing", missing == [])
 
-                head_final, _, final_paths = await archive._remote_state()
-                check("exactly one further commit landed", head_final not in (head_before, head_after))
-                check("archive path set is unchanged by the edit", set(final_paths) == set(paths))
-                check(
-                    "edited transcript has the new blob hash",
-                    final_paths.get(TRANSCRIPT_PATH)
-                    == archive.blob_sha(transcript_file.read_bytes()),
+                async def remote_rows(path: str, blob_sha: str) -> list[dict[str, str]]:
+                    blob = await archive._api(
+                        "GET", archive._repo_path(f"/git/blobs/{blob_sha}")
+                    )
+                    return load_csv(base64.b64decode(blob["content"]), MESSAGE_FIELDS)
+
+                head, _, paths = await archive._remote_state()
+                check("transcript committed", TRANSCRIPT in paths)
+                check("user map committed", USER_MAP in paths)
+
+                remote = await remote_rows(TRANSCRIPT, paths[TRANSCRIPT])
+                check("image stored as its URL", remote[0]["attachments"] == IMAGE)
+                check("video stored as its URL", remote[1]["attachments"] == VIDEO)
+                check("no placeholder anywhere", not any(
+                    "potential image" in v for row in remote for v in row.values()
+                ))
+                check("rows are sorted by snowflake",
+                      [r[MESSAGE_KEY] for r in remote] == ["1", "2"])
+
+                # A message that lands mid-publish must survive the clear.
+                late = message_row(record(3, "arrived during publish", [IMAGE]))
+                append_row(root / "TestServer" / "general.csv", MESSAGE_FIELDS, late)
+
+                archive.clear_published(published)
+                after_clear = read_rows(root / "TestServer" / "general.csv", MESSAGE_FIELDS)
+                check("confirmed rows are cleared from the buffer",
+                      [r[MESSAGE_KEY] for r in after_clear] == ["3"])
+                check("unconfirmed row survives the clear", len(after_clear) == 1)
+
+                check("republish of identical rows is a no-op", await archive.publish() is not None)
+                second = await archive.publish()
+                check("republish reports nothing new", second == {})
+
+                append_row(
+                    root / "TestServer" / "general.csv",
+                    MESSAGE_FIELDS,
+                    message_row(record(4, "fourth", [], reply={
+                        "message_id": 1, "author_id": 1001,
+                        "author_username": "user1", "content_snippet": "hello",
+                    })),
                 )
+                pub2 = await archive.publish()
+                check("later message is appended", sorted(pub2[TRANSCRIPT]) == ["4"])
+                check("verify passes again", await archive.verify(pub2) == [])
+
+                head_after, _, final_paths = await archive._remote_state()
+                check("no path was ever deleted", set(final_paths) == set(paths))
+                check("append created a new commit", head_after != head)
+
+                final_rows = await remote_rows(TRANSCRIPT, final_paths[TRANSCRIPT])
+                check("archive holds all four messages",
+                      [r[MESSAGE_KEY] for r in final_rows] == ["1", "2", "3", "4"])
+                check("reply columns recorded", final_rows[3]["reply_to_id"] == "1"
+                      and final_rows[3]["reply_to_author"] == "user1")
             finally:
                 await archive.close()
     finally:
