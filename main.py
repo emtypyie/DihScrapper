@@ -196,8 +196,8 @@ async def publish() -> None:
 async def push_loop() -> None:
     await bot.wait_until_ready()
     while True:
-        await asyncio.sleep(PUSH_INTERVAL)
         await publish()
+        await asyncio.sleep(PUSH_INTERVAL)
 
 
 @bot.event
