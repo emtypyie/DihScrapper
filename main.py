@@ -180,15 +180,19 @@ async def on_message(message: discord.Message) -> None:
     if not isinstance(message.channel, discord.TextChannel):
         return
 
-    if bot.user in message.mentions:
-        print("Makima is Listening :3")
-
     record = await build_message(message)
     row = message_row(record)
     async with _buffer_lock:
         append_row(channel_path(message.channel), MESSAGE_FIELDS, row)
         record_users(message.guild, [record])
     logger.debug("Buffered message %s from #%s", message.id, message.channel.name)
+
+    if bot.user in message.mentions:
+        # Guarded: a failed reply must not cost us the archive row above.
+        try:
+            await message.reply("Makima is Listening :3")
+        except discord.HTTPException as exc:
+            logger.warning("Could not reply to mention in #%s: %s", message.channel, exc)
 
 
 async def wait_for_shutdown(stop: asyncio.Event) -> None:
