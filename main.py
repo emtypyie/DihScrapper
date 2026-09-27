@@ -295,17 +295,31 @@ async def on_message(message: discord.Message) -> None:
     logger.debug("Archived message %s from #%s", message.id, message.channel.name)
 
 
-def request_shutdown() -> None:
-    logger.info("Shutdown requested; closing gateway")
-    task = asyncio.create_task(bot.close())
-    task.add_done_callback(lambda _: asyncio.get_event_loop().stop())
+async def wait_for_shutdown(stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: loop.call_soon_threadsafe(stop.set))
+    await stop.wait()
 
 
 async def main() -> None:
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, request_shutdown)
-    await bot.start(os.environ["DISCORD_API"])
+    stop = asyncio.Event()
+    runner = asyncio.create_task(bot.start(os.environ["DISCORD_API"]))
+    waiter = asyncio.create_task(wait_for_shutdown(stop))
+    done, pending = await asyncio.wait(
+        {runner, waiter}, return_when=asyncio.FIRST_COMPLETED
+    )
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    if not bot.is_closed():
+        await bot.close()
+    if runner in done and (failure := runner.exception()) is not None:
+        raise failure
+    logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ load_dotenv()
 
 logger = logging.getLogger("DihScrapper.upload")
 
-GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "emtypyie")
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "myrachane")
 GITHUB_DATA_REPO = os.environ.get("GITHUB_DATA_REPO", "ScrapedDih")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
@@ -44,8 +44,6 @@ ASKPASS_BAT = """@echo off
 echo %1 | findstr /i "username" >nul
 if %ERRORLEVEL%==0 (echo %GIT_ASKPASS_USERNAME%) else (echo %GIT_ASKPASS_PASSWORD%)
 """
-
-REMOTE_EMPTY_MARKERS = ("couldn't find remote ref", "remote branch does not exist")
 
 
 class SyncError(RuntimeError):
@@ -91,7 +89,12 @@ class DataRepoSync:
         return env
 
     async def _git(self, *args: str, check: bool = True) -> tuple[int, str, str]:
-        cmd = ["git", "-c", "safe.directory=*", *args]
+        cmd = [
+            "git",
+            "-c", "safe.directory=*",
+            "-c", "credential.helper=",
+            *args,
+        ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=self.data_root,
@@ -139,26 +142,40 @@ class DataRepoSync:
             elif out.strip() != self.remote:
                 await self._git("remote", "set-url", "origin", self.remote)
 
-    async def _integrate_remote(self) -> None:
-        code, _, err = await self._git("fetch", "--depth", "1", "origin", self.branch, check=False)
-        remote_exists = not (code != 0 and any(m in err for m in REMOTE_EMPTY_MARKERS))
+    async def _has_revision(self, revision: str) -> bool:
+        return (await self._git("rev-parse", "--verify", "--quiet", revision, check=False))[0] == 0
 
-        has_local = (await self._git("rev-parse", "--verify", "HEAD", check=False))[0] == 0
+    async def _integrate_remote(self) -> None:
+        code, _, err = await self._git(
+            "fetch", "--depth", "1", "origin", self.branch, check=False
+        )
+        if code != 0 and "not found" in err.lower() and "repository" in err.lower():
+            raise SyncError(f"cannot reach {self.remote}: {err.strip()}")
+
+        remote_exists = code == 0 and await self._has_revision("FETCH_HEAD")
+        local_exists = await self._has_revision("HEAD")
 
         if not remote_exists:
-            if not has_local:
-                await self._git("commit", "--allow-empty", "-m", "Initialise archive", check=False)
+            logger.info("Remote branch %s has no commits yet; it will be created", self.branch)
             return
 
-        if not has_local:
+        if not local_exists:
             await self._git("reset", "--hard", "FETCH_HEAD")
+            return
+
+        code, _, _ = await self._git("merge", "--ff-only", "FETCH_HEAD", check=False)
+        if code == 0:
             return
 
         code, _, err = await self._git("rebase", "FETCH_HEAD", check=False)
-        if code != 0:
-            await self._git("rebase", "--abort", check=False)
-            logger.warning("Rebase onto remote failed (%s); resetting to remote state", err.strip())
-            await self._git("reset", "--hard", "FETCH_HEAD")
+        if code == 0:
+            return
+
+        await self._git("rebase", "--abort", check=False)
+        raise SyncError(
+            "local and remote history diverged and could not be rebased "
+            f"({err.strip()}); archive left untouched, resolve manually"
+        )
 
     async def _commit_changes(self) -> bool:
         await self._git("add", "-A", ".")

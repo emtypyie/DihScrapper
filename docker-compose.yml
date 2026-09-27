@@ -9,7 +9,7 @@ services:
       - .env
     environment:
       DATA_ROOT: /app/HOME
-      GITHUB_OWNER: ${GITHUB_OWNER:-emtypyie}
+      GITHUB_OWNER: ${GITHUB_OWNER:-myrachane}
       GITHUB_DATA_REPO: ${GITHUB_DATA_REPO:-ScrapedDih}
       GITHUB_BRANCH: ${GITHUB_BRANCH:-main}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
