@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import signal
+import time
 from pathlib import Path
 
 import discord
@@ -131,23 +132,23 @@ async def push_once() -> None:
     The clear is gated on verification, so a failed or partial push leaves the
     buffer intact and the next cycle retries the same rows. Because the merge is
     keyed on message id, a retry is idempotent even if the commit landed.
+
+    The lock is held only while reading and rewriting local files, never across
+    the network round trips. Clearing is keyed on the ids actually published, so
+    a message buffered while the push is in flight is simply not in that set and
+    is left on disk for the next cycle -- the lock is not what makes this safe.
     """
-    async with _buffer_lock:
-        try:
-            published = await archive.publish()
-        except Exception as exc:
-            logger.error("Archive publish failed: %s", exc)
-            return
+    try:
+        async with _buffer_lock:
+            payloads = archive.pending_payloads()
+
+        published = await archive.publish(payloads=payloads)
         if not published:
             logger.info("Nothing new to push")
             return
 
         total = sum(len(ids) for ids in published.values())
-        try:
-            missing = await archive.verify(published)
-        except Exception as exc:
-            logger.error("Archive verify failed, keeping local buffer: %s", exc)
-            return
+        missing = await archive.verify(published)
         if missing:
             logger.error(
                 "Archive is missing %d message(s) after push, keeping local buffer",
@@ -155,14 +156,27 @@ async def push_once() -> None:
             )
             return
 
-        await archive.clear_published(published)
+        async with _buffer_lock:
+            archive.clear_published(published)
         logger.info("Pushed and verified %d message(s); local buffer cleared", total)
+    except Exception:
+        # Never let an unexpected error here end the cycle: the next tick simply
+        # retries, and the buffer is only ever cleared after verification.
+        logger.exception("Push cycle failed, local buffer left intact")
 
 
 async def push_loop() -> None:
     await bot.wait_until_ready()
     while True:
-        await push_once()
+        started = time.monotonic()
+        logger.debug("Push cycle starting")
+        try:
+            await push_once()
+        except Exception:
+            logger.exception("Push cycle raised unexpectedly; continuing")
+        elapsed = time.monotonic() - started
+        if elapsed > PUSH_INTERVAL / 2:
+            logger.warning("Push cycle took %.1fs of a %ds interval", elapsed, PUSH_INTERVAL)
         await asyncio.sleep(PUSH_INTERVAL)
 
 

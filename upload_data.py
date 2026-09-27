@@ -82,6 +82,9 @@ class ArchiveError(RuntimeError):
     pass
 
 
+REQUEST_TIMEOUT = 30.0
+
+
 def git_blob_sha(payload: bytes) -> str:
     return hashlib.sha1(b"blob " + str(len(payload)).encode() + b"\0" + payload).hexdigest()
 
@@ -122,7 +125,14 @@ class GitHubArchive:
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            self._session = aiohttp.ClientSession(headers=self._headers())
+            # aiohttp's default total timeout is 300s, which would let one hung
+            # request stall a publish cycle for five minutes with nothing logged.
+            # The bot retries on its next tick, so failing fast is the useful
+            # behaviour here.
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            self._session = aiohttp.ClientSession(
+                headers=self._headers(), timeout=timeout
+            )
         return self._session
 
     async def close(self) -> None:
@@ -135,8 +145,17 @@ class GitHubArchive:
         method: str,
         path: str,
         payload: object = None,
-        allow_missing: tuple[int, ...] = (404,),
+        allow_missing: tuple[int, ...] = (),
     ):
+        """Call the GitHub API.
+
+        ``allow_missing`` defaults to nothing, so a 404 raises. That is the
+        strict default on purpose: a swallowed error would return ``None`` and
+        let a caller believe a write had landed when it had not. The handful of
+        places where a missing object is genuinely expected -- an empty
+        repository, a branch that does not exist yet, a file not yet published
+        -- pass the statuses they tolerate explicitly.
+        """
         if not self.configured:
             raise ArchiveError("GitHub archive is not configured")
         session = await self._ensure_session()
@@ -233,6 +252,15 @@ class GitHubArchive:
             payloads[relative] = path.read_bytes()
         return payloads
 
+    def pending_payloads(self) -> dict[str, bytes]:
+        """Snapshot the local buffers.
+
+        Callers that mutate those files should hold their own lock around this
+        and around :meth:`clear_published`, so no lock is held while the
+        publish round trips are in flight.
+        """
+        return self._local_payloads()
+
     @staticmethod
     def _spec_for(path: str):
         """Resolve the CSV schema for an archive path, or None if it is not CSV."""
@@ -251,20 +279,29 @@ class GitHubArchive:
         blob = await self._api("GET", self._repo_path(f"/git/blobs/{blob_sha}"))
         return load_csv(base64.b64decode(blob["content"]), fields)
 
-    async def publish(self, dry_run: bool = False) -> dict[str, list[str]]:
+    async def publish(
+        self,
+        dry_run: bool = False,
+        payloads: dict[str, bytes] | None = None,
+    ) -> dict[str, list[str]]:
         """Append buffered rows to the archive, returning the keys committed.
 
         Strictly append-only. Rows already present remotely are skipped, and no
         path is ever deleted, so a publish can only ever grow the archive. That
         also removes the hazard of publishing from a machine with no local data:
         there is nothing for an empty buffer to destroy.
+
+        ``payloads`` lets the caller hand in a snapshot taken under its own lock,
+        so this method performs no local file access and the caller can avoid
+        holding a lock across the network round trips.
         """
         if not self.configured:
             logger.info("GitHub archive not configured; skipping publish")
             return {}
 
         head_sha, tree_sha, remote_paths = await self._remote_state()
-        payloads = self._local_payloads()
+        if payloads is None:
+            payloads = self._local_payloads()
 
         entries: list[dict] = []
         blobs: dict[str, bytes] = {}

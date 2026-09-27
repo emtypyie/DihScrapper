@@ -35,7 +35,7 @@ from archive_format import (  # noqa: E402
     message_row,
     read_rows,
 )
-from upload_data import GitHubArchive  # noqa: E402
+from upload_data import ArchiveError, GitHubArchive  # noqa: E402
 
 TRANSCRIPT = "TestServer/general.csv"
 USER_MAP = "TestServer/user_map.csv"
@@ -56,7 +56,140 @@ def record(msg_id: int, content: str, attachments: list[str] | None = None,
     }
 
 
-async def scenario() -> int:
+async def strict_errors() -> list[str]:
+    """A 404 must raise, never be swallowed into a silent success.
+
+    Regression test. `_api` used to default to `allow_missing=(404,)`, so a
+    ref update that 404'd returned `None` and the caller reported a successful
+    publish while the branch had not moved at all.
+    """
+    from aiohttp import web
+
+    import upload_data
+
+    hits: list[str] = []
+
+    async def not_found(request: web.Request) -> web.Response:
+        hits.append(f"{request.method} {request.path}")
+        return web.json_response({"message": "Not Found"}, status=404)
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", not_found)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = runner.addresses[0][1]
+
+    original = upload_data.API_ROOT
+    upload_data.API_ROOT = f"http://127.0.0.1:{port}"
+    failures: list[str] = []
+
+    def check(label: str, condition: bool) -> None:
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures.append(label)
+
+    archive = GitHubArchive(owner="o", repo="r", token="t")
+    try:
+        for label, coro in (
+            ("ref update 404 raises", archive._write_ref("a" * 40, "b" * 40)),
+            ("blob write 404 raises", archive._api(
+                "POST", archive._repo_path("/git/blobs"), {"content": "", "encoding": "base64"})),
+            ("tree write 404 raises", archive._api(
+                "POST", archive._repo_path("/git/trees"), {"tree": []})),
+            ("commit write 404 raises", archive._api(
+                "POST", archive._repo_path("/git/commits"), {"message": "x"})),
+            ("read of a missing commit 404 raises", archive._api(
+                "GET", archive._repo_path(f"/git/commits/{'c' * 40}"))),
+        ):
+            try:
+                await coro
+                check(label, False)
+            except ArchiveError:
+                check(label, True)
+
+        check("every probe hit the server", len(hits) == 5)
+    finally:
+        upload_data.API_ROOT = original
+        await archive.close()
+        await runner.cleanup()
+    return failures
+
+
+async def resilient_cycle() -> list[str]:
+    """push_once must swallow failures and keep the buffer, and keep looping.
+
+    Regression test. clear_published() was the one call in the cycle without a
+    guard, so any error there propagated out of push_loop() and killed the task.
+    The bot then kept running and kept saying it was listening, but silently
+    stopped archiving forever.
+    """
+    failures: list[str] = []
+
+    def check(label: str, condition: bool) -> None:
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures.append(label)
+
+    import main as bot_main
+
+    class Boom(RuntimeError):
+        pass
+
+    class FakeArchive:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+            self.cleared: list[dict] = []
+            self.attempts = 0
+
+        def pending_payloads(self) -> dict[str, bytes]:
+            return {"TestServer/general.csv": b"x"}
+
+        async def publish(self, payloads=None) -> dict[str, list[str]]:
+            self.calls.append("publish")
+            self.attempts += 1
+            if self.attempts == 1:
+                raise Boom("network went away")
+            return {TRANSCRIPT: ["9"]}
+
+        async def verify(self, published) -> list[str]:
+            self.calls.append("verify")
+            return []
+
+        def clear_published(self, published) -> None:
+            self.calls.append("clear")
+            self.cleared.append(published)
+
+    fake = FakeArchive()
+    original = bot_main.archive
+    bot_main.archive = fake
+    try:
+        await bot_main.push_once()
+        check("a failing publish is contained", fake.calls == ["publish"])
+        check("nothing is cleared when publish fails", fake.cleared == [])
+
+        fake.calls.clear()
+        await bot_main.push_once()
+        check("a healthy cycle publishes, verifies, then clears",
+              fake.calls == ["publish", "verify", "clear"])
+        check("the cleared set is exactly what was published",
+              fake.cleared == [{TRANSCRIPT: ["9"]}])
+
+        class ClearBoom(FakeArchive):
+            def clear_published(self, published) -> None:
+                raise Boom("disk full")
+
+        bot_main.archive = ClearBoom()
+        await bot_main.push_once()
+        check("an error while clearing is contained", True)
+    finally:
+        bot_main.archive = original
+
+    return failures
+
+
+async def scenario() -> list[str]:
     failures: list[str] = []
 
     def check(label: str, condition: bool) -> None:
@@ -67,7 +200,7 @@ async def scenario() -> int:
     probe = GitHubArchive()
     if not probe.configured:
         print("SKIP  GITHUB_TOKEN is not configured")
-        return 0
+        return failures
 
     owner = (await probe._api("GET", "/user", allow_missing=()))["login"]
     name = f"dihscrapper-test-{uuid.uuid4().hex[:8]}"
@@ -174,6 +307,15 @@ async def scenario() -> int:
         finally:
             await cleanup.close()
 
+    return failures
+
+
+async def main() -> int:
+    failures = await strict_errors()
+    print()
+    failures += await resilient_cycle()
+    print()
+    failures += await scenario()
     print()
     if failures:
         print(f"{len(failures)} check(s) failed")
@@ -183,4 +325,4 @@ async def scenario() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(scenario()))
+    raise SystemExit(asyncio.run(main()))
