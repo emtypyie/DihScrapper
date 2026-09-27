@@ -12,8 +12,8 @@ API calls regardless of archive size.
 
 Usable as a library from ``main.py`` or standalone::
 
-    python upload_data.py            # append, verify, then clear, and exit
-    python upload_data.py --dry-run  # report what would be appended
+    python uploader.py            # append, verify, then clear, and exit
+    python uploader.py --dry-run  # report what would be appended
 """
 
 from __future__ import annotations

@@ -175,8 +175,8 @@ than the interval still leaves its messages in the archive.
 ## Publishing on demand
 
 ```bash
-python upload_data.py             # append, verify, clear, then exit
-python upload_data.py --dry-run   # show what would be appended
+python uploader.py             # append, verify, clear, then exit
+python uploader.py --dry-run   # show what would be appended
 ```
 
 Safe to run from anywhere: publishing only ever appends, so an empty local buffer cannot
@@ -184,7 +184,7 @@ damage the archive. It still needs to point at the same `DATA_ROOT` holding the 
 rows, so from the container that is:
 
 ```bash
-docker compose exec dihscrapper python upload_data.py
+docker compose exec dihscrapper python uploader.py
 ```
 
 ## Tests

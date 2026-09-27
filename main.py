@@ -29,7 +29,7 @@ from archive_format import (
     read_rows,
     rewrite,
 )
-from upload_data import GitHubArchive
+from uploader import GitHubArchive
 
 load_dotenv()
 

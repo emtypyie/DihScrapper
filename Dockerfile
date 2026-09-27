@@ -15,7 +15,7 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py upload_data.py archive_format.py ./
+COPY main.py uploader.py archive_format.py ./
 RUN mkdir -p /app/HOME
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \

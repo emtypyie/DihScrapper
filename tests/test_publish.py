@@ -35,7 +35,7 @@ from archive_format import (  # noqa: E402
     message_row,
     read_rows,
 )
-from upload_data import ArchiveError, GitHubArchive  # noqa: E402
+from uploader import ArchiveError, GitHubArchive  # noqa: E402
 
 TRANSCRIPT = "TestServer/general.csv"
 USER_MAP = "TestServer/user_map.csv"
@@ -65,7 +65,7 @@ async def strict_errors() -> list[str]:
     """
     from aiohttp import web
 
-    import upload_data
+    import uploader
 
     hits: list[str] = []
 
@@ -81,8 +81,8 @@ async def strict_errors() -> list[str]:
     await site.start()
     port = runner.addresses[0][1]
 
-    original = upload_data.API_ROOT
-    upload_data.API_ROOT = f"http://127.0.0.1:{port}"
+    original = uploader.API_ROOT
+    uploader.API_ROOT = f"http://127.0.0.1:{port}"
     failures: list[str] = []
 
     def check(label: str, condition: bool) -> None:
@@ -111,7 +111,7 @@ async def strict_errors() -> list[str]:
 
         check("every probe hit the server", len(hits) == 5)
     finally:
-        upload_data.API_ROOT = original
+        uploader.API_ROOT = original
         await archive.close()
         await runner.cleanup()
     return failures
