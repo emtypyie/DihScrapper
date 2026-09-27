@@ -9,7 +9,7 @@ lol.
 
 DihScrapper is a Discord bot that mirrors messages into a private GitHub
 repository as they arrive. Point it at a server, invite it, and it builds a timestamped
-JSON transcript of the conversation — text, replies, and the user directory that ties
+CSV transcript of the conversation — text, replies, and the user directory that ties
 them together. Point a training pipeline at the repo and you have a dataset that keeps
 itself current.
 
