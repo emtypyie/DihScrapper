@@ -191,6 +191,15 @@ python upload_data.py --dry-run   # show what would change
 
 `--dry-run` reports pending additions, updates, and removals without committing.
 
+Run this **inside the container**, or against the same `DATA_ROOT` that holds the
+transcripts. The local tree is authoritative, so publishing from a machine with an empty
+one looks exactly like a wipe. That case is refused with a non-zero exit; `--allow-empty`
+overrides it if a wipe is genuinely what you want:
+
+```bash
+docker compose exec dihscrapper python upload_data.py
+```
+
 ## Tests
 
 ```bash

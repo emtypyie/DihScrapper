@@ -202,14 +202,28 @@ class GitHubArchive:
             payloads[relative] = path.read_bytes()
         return payloads
 
-    async def publish(self, dry_run: bool = False) -> bool:
-        """Commit the local JSON tree to the archive repository."""
+    async def publish(self, dry_run: bool = False, allow_empty: bool = False) -> bool:
+        """Commit the local JSON tree to the archive repository.
+
+        The local tree is authoritative, so a path that vanishes locally is
+        deleted remotely. That makes an empty local tree indistinguishable from a
+        wiped one, which is exactly what happens when publishing is run outside
+        the container that holds the volume -- so an empty local tree against a
+        non-empty archive is refused unless ``allow_empty`` is set.
+        """
         if not self.configured:
             logger.info("GitHub archive not configured; skipping publish")
             return False
 
         head_sha, tree_sha, remote_paths = await self._remote_state()
         payloads = self._local_payloads()
+
+        if not payloads and remote_paths and not allow_empty:
+            raise ArchiveError(
+                f"local archive at {self.data_root} is empty but {self.owner}/{self.repo} "
+                f"tracks {len(remote_paths)} file(s); refusing to delete them. Publish from the "
+                "container that holds the volume, or pass allow_empty to override."
+            )
 
         entries: list[dict] = []
         added: list[str] = []
@@ -311,7 +325,7 @@ class GitHubArchive:
 async def _run(args: argparse.Namespace) -> None:
     archive = GitHubArchive()
     try:
-        await archive.publish(dry_run=args.dry_run)
+        await archive.publish(dry_run=args.dry_run, allow_empty=args.allow_empty)
     except ArchiveError as exc:
         logger.error("Publish failed: %s", exc)
         raise SystemExit(1) from exc
@@ -326,6 +340,11 @@ def main() -> None:
     )
     parser = argparse.ArgumentParser(description="Publish the archive to GitHub.")
     parser.add_argument("--dry-run", action="store_true", help="report without committing")
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="publish even when the local tree is empty, which deletes the remote archive",
+    )
     args = parser.parse_args()
     asyncio.run(_run(args))
 
