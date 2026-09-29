@@ -13,7 +13,6 @@ import time
 from pathlib import Path
 
 import discord
-from dotenv import load_dotenv
 
 from archive_format import (
     MESSAGE_FIELDS,
@@ -23,14 +22,11 @@ from archive_format import (
     read_rows,
     rewrite,
 )
+from logger import setup_logging
 from uploader import GitHubArchive
 
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# writes the log file; shipping is a separate process so it outlives us
+setup_logging()
 logger = logging.getLogger("DihScrapper")
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "HOME"))
@@ -79,9 +75,7 @@ def record_users(guild: discord.Guild, messages: list[dict]) -> None:
     rewrite(path, USER_FIELDS, sorted(rows.values(), key=lambda r: r["username"].lower()))
 
 
-async def fetch_reference(
-    channel: discord.TextChannel, message_id: int
-) -> discord.Message | None:
+async def fetch_reference(channel: discord.TextChannel, message_id: int) -> discord.Message | None:
     try:
         return await channel.fetch_message(message_id)
     except discord.NotFound:
@@ -213,8 +207,13 @@ async def main() -> None:
     for task in pending:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)
+    if _push_task is not None:
+        _push_task.cancel()
+        await asyncio.gather(_push_task, return_exceptions=True)
     if not bot.is_closed():
         await bot.close()
+    # no final log upload: the sidecar owns that, and a half-done upload here
+    # would only delay a hard death
     await archive.close()
     if runner in done and (failure := runner.exception()) is not None:
         raise failure

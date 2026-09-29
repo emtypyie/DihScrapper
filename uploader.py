@@ -127,9 +127,7 @@ class GitHubArchive:
             # stall a cycle for five minutes with nothing logged. The next tick
             # retries anyway, so failing fast is the useful behaviour.
             timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            self._session = aiohttp.ClientSession(
-                headers=self._headers(), timeout=timeout
-            )
+            self._session = aiohttp.ClientSession(headers=self._headers(), timeout=timeout)
         return self._session
 
     async def close(self) -> None:
@@ -449,10 +447,9 @@ async def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    from logger import setup_logging
+
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="Append the local buffer to the archive. Never deletes."
     )

@@ -1,6 +1,8 @@
 .env
 HOME/
 data/
+LOGS/
+tests/
 __pycache__/
 *.pyc
 *.pyo
