@@ -1,4 +1,4 @@
-"""Ships log files to a private DihScrapperLogs repo.
+"""Ships log files to a private DihLogger repo.
 
 Separate process on purpose: the crash we want to catch kills main.py, and a
 shipper inside that process dies with it. Sidecar on the shared log volume.
@@ -34,7 +34,7 @@ logger = logging.getLogger("DihScrapper.logs")
 
 LOG_DIR = Path(os.environ.get("LOG_DIR", "LOGS"))
 LOG_NAME = os.environ.get("LOG_NAME", "dihscrapper.log")
-LOG_REPO = os.environ.get("GITHUB_LOG_REPO", "DihScrapperLogs")
+LOG_REPO = os.environ.get("GITHUB_LOG_REPO", "DihLogger")
 LOG_BRANCH = os.environ.get("GITHUB_LOG_BRANCH", "main")
 SHIP_INTERVAL = int(os.environ.get("SHIP_INTERVAL", "60"))
 LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))

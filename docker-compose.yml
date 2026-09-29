@@ -35,7 +35,7 @@ services:
     environment:
       LOG_DIR: /app/LOGS
       GITHUB_OWNER: ${GITHUB_OWNER:-myrachane}
-      GITHUB_LOG_REPO: ${GITHUB_LOG_REPO:-DihScrapperLogs}
+      GITHUB_LOG_REPO: ${GITHUB_LOG_REPO:-DihLogger}
       GITHUB_LOG_BRANCH: ${GITHUB_LOG_BRANCH:-main}
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       SHIP_INTERVAL: 60

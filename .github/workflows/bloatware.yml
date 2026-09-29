@@ -1,0 +1,59 @@
+name: BloatWare
+
+# Formatting gate on the files a pull request actually touches, so an unrelated
+# pre-existing offender elsewhere in the tree cannot fail an otherwise fine PR.
+on:
+  pull_request:
+    paths:
+      - "**/*.py"
+
+permissions:
+  contents: read
+
+jobs:
+  formatting:
+    name: Check formatting of changed files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, so the merge base with the base branch is reachable
+          # and a shallow clone cannot produce a bogus diff.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install formatter
+        run: pip install --disable-pip-version-check ruff==0.14.4
+
+      - name: Collect changed Python files
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD"
+          } | grep -E '\.py$' | sort -u > changed.txt || true
+          echo "Changed Python files:"
+          cat changed.txt
+          count=$(wc -l < changed.txt | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Check formatting
+        if: steps.changed.outputs.count != '0'
+        run: ruff format --check --diff $(cat changed.txt)
+
+      - name: Check lint
+        if: steps.changed.outputs.count != '0'
+        run: ruff check $(cat changed.txt)
+
+      - name: Verify the files compile
+        if: steps.changed.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          while read -r f; do
+            echo "compiling $f"
+            python -m py_compile "$f"
+          done < changed.txt
