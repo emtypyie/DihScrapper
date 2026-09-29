@@ -75,9 +75,7 @@ def record_users(guild: discord.Guild, messages: list[dict]) -> None:
     rewrite(path, USER_FIELDS, sorted(rows.values(), key=lambda r: r["username"].lower()))
 
 
-async def fetch_reference(
-    channel: discord.TextChannel, message_id: int
-) -> discord.Message | None:
+async def fetch_reference(channel: discord.TextChannel, message_id: int) -> discord.Message | None:
     try:
         return await channel.fetch_message(message_id)
     except discord.NotFound:

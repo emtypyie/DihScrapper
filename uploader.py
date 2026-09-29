@@ -127,9 +127,7 @@ class GitHubArchive:
             # stall a cycle for five minutes with nothing logged. The next tick
             # retries anyway, so failing fast is the useful behaviour.
             timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-            self._session = aiohttp.ClientSession(
-                headers=self._headers(), timeout=timeout
-            )
+            self._session = aiohttp.ClientSession(headers=self._headers(), timeout=timeout)
         return self._session
 
     async def close(self) -> None:
