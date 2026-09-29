@@ -82,3 +82,5 @@ jobs:
             echo "compiling $f"
             python -m py_compile "$f"
           done < changed.txt
+
+# touched by a pull request, which is not allowed
