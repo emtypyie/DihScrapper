@@ -9,6 +9,7 @@ services:
       - .env
     environment:
       DATA_ROOT: /app/HOME
+      LOG_DIR: /app/LOGS
       GITHUB_OWNER: ${GITHUB_OWNER:-myrachane}
       GITHUB_DATA_REPO: ${GITHUB_DATA_REPO:-ScrapedDih}
       GITHUB_BRANCH: ${GITHUB_BRANCH:-main}
@@ -17,11 +18,37 @@ services:
       PUSH_INTERVAL: 300
     volumes:
       - home:/app/HOME
+      # shared with the shipper; survives the bot container being killed
+      - logs:/app/LOGS
+    networks:
+      - dihscrapper-net
+
+  logshipper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dihscrapper-logs
+    restart: unless-stopped
+    # no depends_on: must keep shipping while the bot is down or crash-looping
+    env_file:
+      - .env
+    environment:
+      LOG_DIR: /app/LOGS
+      GITHUB_OWNER: ${GITHUB_OWNER:-myrachane}
+      GITHUB_LOG_REPO: ${GITHUB_LOG_REPO:-DihLogger}
+      GITHUB_LOG_BRANCH: ${GITHUB_LOG_BRANCH:-main}
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+      SHIP_INTERVAL: 60
+    command: ["python", "logger.py"]
+    volumes:
+      - logs:/app/LOGS
     networks:
       - dihscrapper-net
 
 volumes:
   home:
+    driver: local
+  logs:
     driver: local
 
 networks:
