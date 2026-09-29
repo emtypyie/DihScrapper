@@ -1,4 +1,4 @@
-"""Ships log files to a private DihLogger repo.
+﻿"""Ships log files to a private DihLogger repo.
 
 Separate process on purpose: the crash we want to catch kills main.py, and a
 shipper inside that process dies with it. Sidecar on the shared log volume.
@@ -40,7 +40,7 @@ SHIP_INTERVAL = int(os.environ.get("SHIP_INTERVAL", "60"))
 LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))
 LOG_BACKUPS = int(os.environ.get("LOG_BACKUPS", "5"))
 
-# own file, so a shipper failure is itself recorded
+# own file: a shipper failure is itself recorded
 SHIPPER_LOG_NAME = "dihscrapper.logshipper.log"
 
 FILE_MODE = "100644"
