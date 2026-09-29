@@ -449,10 +449,9 @@ async def _run(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    from logger import setup_logging
+
+    setup_logging()
     parser = argparse.ArgumentParser(
         description="Append the local buffer to the archive. Never deletes."
     )
