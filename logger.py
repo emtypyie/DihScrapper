@@ -1,4 +1,4 @@
-﻿"""Ships log files to a private DihLogger repo.
+"""Ships log files to a private DihLogger repo.
 
 Separate process on purpose: the crash we want to catch kills main.py, and a
 shipper inside that process dies with it. Sidecar on the shared log volume.
