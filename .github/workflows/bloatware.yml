@@ -1,11 +1,18 @@
 name: BloatWare
 
-# Formatting gate on the files a pull request actually touches, so an unrelated
-# pre-existing offender elsewhere in the tree cannot fail an otherwise fine PR.
+# Two gates, in order:
+#   1. repository rules — no .env, no CI edits, no secrets (RULEBOOK.md)
+#   2. ruff format/lint/compile on the Python the PR actually touches
+#
+# No `paths:` filter, deliberately. It used to be scoped to **/*.py, which meant
+# a PR whose only content was a committed .env or a rewritten workflow file never
+# triggered this workflow at all — precisely the changes the rules exist to stop.
+# The ruff half no-ops on its own when a PR touches no Python.
+#
+# The formatting gate is scoped to changed files so an unrelated pre-existing
+# offender elsewhere in the tree cannot fail an otherwise fine PR.
 on:
   pull_request:
-    paths:
-      - "**/*.py"
 
 permissions:
   contents: read
@@ -14,6 +21,8 @@ jobs:
   formatting:
     name: "🦞 BloatWare"
     runs-on: ubuntu-latest
+    env:
+      BASE: ${{ github.base_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,6 +34,22 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Enforce repository rules
+        run: |
+          set -euo pipefail
+          # The guard is read out of the base ref, not the worktree. Running the
+          # worktree copy would mean a PR that edits .github/scripts/repo_guard.py
+          # gets graded by its own rules, and the base tree is not something a PR
+          # can change. PR Status repeats this check independently.
+          if ! git show "origin/$BASE:.github/scripts/repo_guard.py" > "$RUNNER_TEMP/repo_guard.py"; then
+            echo "::error::repo_guard.py is missing from the base branch, cannot enforce repository rules"
+            exit 1
+          fi
+          python "$RUNNER_TEMP/repo_guard.py" \
+            --base "origin/$BASE" \
+            --report guard-report.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
       - name: Install formatter
         run: pip install --disable-pip-version-check ruff==0.14.4
 
@@ -34,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD"
+            git diff --name-only --diff-filter=ACMR "origin/$BASE...HEAD"
           } | grep -E '\.py$' | sort -u > changed.txt || true
           echo "Changed Python files:"
           cat changed.txt

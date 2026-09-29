@@ -9,6 +9,11 @@ name: PR Status
 #
 # `workflow_run` rather than `pull_request` because these two would otherwise
 # race: the status job has to see BloatWare's conclusion, not guess at it.
+#
+# It also re-runs the repository rules itself, from the base branch, against the
+# pull request API rather than a checkout. That is not duplication for its own
+# sake: it is what makes the rules un-disableable, and it is the only half that
+# can talk to the author.
 on:
   workflow_run:
     workflows: ["BloatWare"]
@@ -27,16 +32,23 @@ jobs:
   status:
     runs-on: ubuntu-latest
     steps:
-      - name: Apply labels and comment
+      # The base branch, not the PR. This is the trusted copy of the guard; the
+      # PR is never checked out here.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect changed files
+        id: collect
         uses: actions/github-script@v7
         with:
           script: |
-            const MARKER = '<!-- pr-status -->';
-            const PASS = 'PIPELINE PASSED';
-            const FAIL = 'PIPELINE FAILED';
-            const REVIEW = 'REVIEW REQUIRED';
-
-            const ok = context.payload.workflow_run.conclusion === 'success';
+            const fs = require('fs');
             const headSha = context.payload.workflow_run.head_sha;
 
             // pull_requests is populated for pull_request runs, but fall back to
@@ -50,6 +62,52 @@ jobs:
               if (!match) { core.info('No open PR for ' + headSha); return; }
               prNumber = match.number;
             }
+
+            // The API's per-file patch, so the guard sees what the author wrote
+            // without a checkout. BloatWare reads the worktree instead; this
+            // path is the one that survives a PR trying to neuter the guard.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              pull_number: prNumber, per_page: 100,
+            });
+            fs.writeFileSync('pr-files.json', JSON.stringify({
+              files: files.map(f => ({ filename: f.filename, patch: f.patch || '' })),
+            }));
+            core.setOutput('pr-number', prNumber);
+
+      - name: Enforce repository rules
+        if: steps.collect.outputs.pr-number != ''
+        run: |
+          set -euo pipefail
+          # Non-zero here would mask the label/comment step below, so the exit
+          # code is deliberately discarded — the verdict is read from the report.
+          python .github/scripts/repo_guard.py \
+            --input pr-files.json \
+            --report pr-guard-report.json || true
+
+      - name: Apply labels and comment
+        if: steps.collect.outputs.pr-number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MARKER = '<!-- pr-status -->';
+            const PASS = 'PIPELINE PASSED';
+            const FAIL = 'PIPELINE FAILED';
+            const REVIEW = 'REVIEW REQUIRED';
+            const RULEBOOK = 'https://github.com/emtypyie/DihScrapper/blob/main/RULEBOOK.md';
+
+            const prNumber = Number('${{ steps.collect.outputs.pr-number }}');
+            const run = context.payload.workflow_run;
+
+            let guard = { ok: true, findings: [] };
+            if (fs.existsSync('pr-guard-report.json')) {
+              guard = JSON.parse(fs.readFileSync('pr-guard-report.json', 'utf8'));
+            }
+
+            // Authoritative: BloatWare's conclusion AND this workflow's own scan.
+            const violations = guard.findings || [];
+            const ok = run.conclusion === 'success' && violations.length === 0;
 
             // Create any missing label, so a fresh repo or a renamed label still works.
             const wanted = ok
@@ -79,9 +137,29 @@ jobs:
               await github.rest.issues.removeLabel({ ...context.repo, issue_number: prNumber, name: n });
             }
 
-            const body = ok
-              ? `${MARKER}\n@${pr.user.login} — all pipeline checks passed go get some coffee it would take time to get this reviewed.`
-              : `${MARKER}\n@${pr.user.login} — pipeline failed ❌ Cannot Merge in main, Please Do follow the guidelines and update the PR lol`;
+            const RULEBOOK_LINK = `Rules, and how to satisfy each one: [RULEBOOK.md](${RULEBOOK})`;
+
+            let body;
+            if (ok) {
+              body = `${MARKER}\n@${pr.user.login} — all pipeline checks passed go get some coffee it would take time to get this reviewed.\n\n${RULEBOOK_LINK}`;
+            } else {
+              let detail = '';
+              if (violations.length) {
+                const rows = violations.map(f => {
+                  const where = f.line ? `${f.file}:${f.line}` : f.file;
+                  return `| ${f.title} | \`${where}\` | ${f.detail} |`;
+                });
+                detail =
+                  `\n\n**${violations.length} rule violation(s) — fix these and push again:**\n\n` +
+                  `| Rule | Where | Detail |\n| --- | --- | --- |\n${rows.join('\n')}\n`;
+              } else {
+                // Green rules, red pipeline: the failure is formatting or CI.
+                detail =
+                  `\n\nNo rule violations — the failure is in the run itself: ` +
+                  `[${run.name} #${run.id}](${run.html_url})\n`;
+              }
+              body = `${MARKER}\n@${pr.user.login} — pipeline failed ❌ Cannot Merge in main, Please Do follow the guidelines and update the PR lol${detail}\n\n${RULEBOOK_LINK}`;
+            }
 
             // One sticky comment: edit the existing one so pushes do not spam the PR.
             const { data: comments } = await github.rest.issues.listComments({
