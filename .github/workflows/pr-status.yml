@@ -80,8 +80,8 @@ jobs:
             }
 
             const body = ok
-              ? `${MARKER}\n@${pr.user.login} — all pipeline checks passed ✅ A maintainer will review and merge it, please wait.`
-              : `${MARKER}\n@${pr.user.login} — pipeline failed ❌ Please follow the guidelines and fix the failing run.`;
+              ? `${MARKER}\n@${pr.user.login} — all pipeline checks passed go get some coffee it would take time to get this reviewed.`
+              : `${MARKER}\n@${pr.user.login} — pipeline failed ❌ Cannot Merge in main, Please Do follow the guidelines and update the PR lol`;
 
             // One sticky comment: edit the existing one so pushes do not spam the PR.
             const { data: comments } = await github.rest.issues.listComments({
