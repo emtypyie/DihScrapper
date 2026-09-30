@@ -34,7 +34,10 @@ PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+# members stays off on purpose. It is never queried: record_users builds its map
+# from the author data already in the message payload. Enabling it makes discord.py
+# cache every member of every guild for the process lifetime, which is unbounded
+# and was a prime suspect for the OOM kills seen next to a second bot on the host.
 bot = discord.Client(intents=intents)
 
 archive = GitHubArchive(data_root=DATA_ROOT)
