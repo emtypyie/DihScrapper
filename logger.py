@@ -49,7 +49,10 @@ REPO_CREATE_ATTEMPTS = 10
 REPO_CREATE_DELAY = 1.0
 
 
-def setup_logging(name: str = SHIPPER_LOG_NAME, log_dir: Path | None = None) -> Path:
+def setup_logging(name: str = LOG_NAME, log_dir: Path | None = None) -> Path:
+    # Defaults to the bot's log, not the shipper's. The shipper passes
+    # SHIPPER_LOG_NAME explicitly: two processes rotating one file is unsafe,
+    # and the bot has no reason to write to the shipper's log.
     # RotatingFileHandler flushes per emit, so no buffered lines are lost.
     directory = Path(log_dir or LOG_DIR)
     directory.mkdir(parents=True, exist_ok=True)
@@ -249,7 +252,7 @@ async def _run(once: bool) -> int:
 
 
 def main() -> int:
-    setup_logging()
+    setup_logging(name=SHIPPER_LOG_NAME)
     parser = argparse.ArgumentParser(description="Ship log files to the private log repository.")
     parser.add_argument("--once", action="store_true", help="ship a single cycle, then exit")
     args = parser.parse_args()
