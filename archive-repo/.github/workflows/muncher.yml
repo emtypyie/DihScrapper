@@ -1,0 +1,66 @@
+# Merge the archive's inbox batches into its transcripts.
+#
+# This file belongs in ScrapedDih, not in DihScrapper: a workflow only fires for
+# pushes to its own repository, and the trigger is the bot committing to
+# inbox/ in the archive. It lives in archive-repo/ here as the copy of record --
+# run archive-repo/sync.ps1 to install it.
+#
+# The bot commits small batches to inbox/ and never rewrites a transcript, because
+# a git blob is immutable and rewriting one costs more every week. This does that
+# work where nothing times out.
+#
+# Maintainer-owned: RULEBOOK rule 2 keeps .github/workflows/ out of contributor PRs.
+name: muncher
+
+on:
+  push:
+    branches: [main]
+    paths: ['inbox/**']
+
+permissions:
+  contents: write
+
+# Two merges must never interleave: both rewrite the same transcripts.
+concurrency:
+  group: muncher
+  cancel-in-progress: false
+
+jobs:
+  munch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Munch the inbox
+        run: |
+          set -euo pipefail
+          git config user.name muncher
+          git config user.email muncher@users.noreply.github.com
+
+          # The bot commits to main too, so a batch can land between the merge and
+          # the push. Rebase and munch again rather than lose the race: the loser
+          # of a push race keeps its batches on the branch, so nothing is lost.
+          for attempt in 1 2 3 4 5; do
+            message="$(python muncher.py)"
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "$message"
+            fi
+
+            # Push even when this pass produced no commit: an earlier pass may have
+            # rebased and left one behind, and exiting on an empty inbox first is
+            # how a merge commit gets silently left behind with the batches still
+            # on the branch.
+            if git pull --rebase && git push; then
+              exit 0
+            fi
+            git rebase --abort 2>/dev/null || true
+            echo "push rejected on attempt $attempt, rebasing"
+          done
+
+          echo "could not push the merge after 5 attempts" >&2
+          exit 1
