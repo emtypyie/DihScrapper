@@ -1,0 +1,52 @@
+2026-10-01 12:43:26,267 [WARNING] discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-10-01 12:43:26,267 [WARNING] discord.client: davey is not installed, voice will NOT be supported
+2026-10-01 12:43:26,268 [INFO] discord.client: logging in using static token
+2026-10-01 12:43:29,267 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: 3708502c409ab848ba3ed8bd08a4cdee).
+2026-10-01 12:43:31,439 [INFO] DihScrapper: Authenticated as BloatWare#2815, listening for new messages
+2026-10-01 12:43:40,193 [INFO] DihScrapper.upload: Appended 3 row(s) across 1 file(s) to myrachane/ScrapedDih@main
+2026-10-01 12:43:43,860 [INFO] DihScrapper: Pushed and verified 3 message(s); local buffer cleared
+2026-10-01 12:44:01,912 [INFO] DihScrapper: Shutdown complete
+2026-10-01 12:44:08,418 [WARNING] discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-10-01 12:44:08,418 [WARNING] discord.client: davey is not installed, voice will NOT be supported
+2026-10-01 12:44:08,419 [INFO] discord.client: logging in using static token
+2026-10-01 12:44:11,936 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: ae69fece2f83bcbcdd1a67bd4432e486).
+2026-10-01 12:44:13,964 [INFO] DihScrapper: Authenticated as BloatWare#2815, listening for new messages
+2026-10-01 12:44:20,006 [INFO] DihScrapper.upload: Nothing new to append to myrachane/ScrapedDih
+2026-10-01 12:44:20,006 [INFO] DihScrapper: Nothing new to push
+2026-10-01 12:49:33,239 [INFO] DihScrapper.upload: Appended 3 row(s) across 1 file(s) to myrachane/ScrapedDih@main
+2026-10-01 12:49:41,252 [INFO] DihScrapper: Pushed and verified 3 message(s); local buffer cleared
+2026-10-01 12:54:50,433 [INFO] DihScrapper.upload: Appended 3 row(s) across 1 file(s) to myrachane/ScrapedDih@main
+2026-10-01 12:54:54,040 [INFO] DihScrapper: Pushed and verified 3 message(s); local buffer cleared
+2026-10-01 13:00:02,859 [INFO] DihScrapper.upload: Appended 3 row(s) across 2 file(s) to myrachane/ScrapedDih@main
+2026-10-01 13:00:07,460 [INFO] DihScrapper: Pushed and verified 3 message(s); local buffer cleared
+2026-10-01 13:05:17,000 [INFO] DihScrapper.upload: Appended 3 row(s) across 1 file(s) to myrachane/ScrapedDih@main
+2026-10-01 13:05:20,671 [INFO] DihScrapper: Pushed and verified 3 message(s); local buffer cleared
+2026-10-01 14:49:47,531 [WARNING] discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-10-01 14:49:47,532 [WARNING] discord.client: davey is not installed, voice will NOT be supported
+2026-10-01 14:49:47,533 [INFO] discord.client: logging in using static token
+2026-10-01 14:49:59,034 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: addabf6e557d9e3b2b4e35f48bafc200).
+2026-10-01 14:50:01,061 [INFO] DihScrapper: Authenticated as BloatWare#2815, listening for new messages
+2026-10-01 14:50:14,429 [INFO] DihScrapper.upload: Nothing new to append to myrachane/ScrapedDih
+2026-10-01 14:50:14,429 [INFO] DihScrapper: Nothing new to push
+2026-10-01 14:54:56,758 [WARNING] discord.gateway: Can't keep up, shard ID None websocket is 11.0s behind.
+2026-10-01 14:55:56,130 [ERROR] DihScrapper: Push cycle failed, local buffer left intact
+Traceback (most recent call last):
+  File "/home/emty/EMTYPYIE/prod/DihScrapper/main.py", line 128, in push_once
+    published = await archive.publish(payloads=payloads)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/emty/EMTYPYIE/prod/DihScrapper/uploader.py", line 333, in publish
+    await self._api(
+    ...<6 lines>...
+    )
+  File "/home/emty/EMTYPYIE/prod/DihScrapper/uploader.py", line 160, in _api
+    raise ArchiveError(f"{method} {path} failed ({response.status}): {text[:300]}")
+uploader.ArchiveError: POST /repos/myrachane/ScrapedDih/git/blobs failed (400): {"message": "We received a malformed request from your client. Sorry about that. Please try resubmitting your request and contact us if the problem persists."}
+
+2026-10-01 14:57:09,315 [INFO] DihScrapper: Shutdown complete
+2026-10-01 14:57:15,525 [WARNING] discord.client: PyNaCl is not installed, voice will NOT be supported
+2026-10-01 14:57:15,525 [WARNING] discord.client: davey is not installed, voice will NOT be supported
+2026-10-01 14:57:15,526 [INFO] discord.client: logging in using static token
+2026-10-01 14:57:32,380 [INFO] discord.gateway: Shard ID None has connected to Gateway (Session ID: 0723ef4a9b84a9ff8f9c360ae4c5ac64).
+2026-10-01 14:57:34,402 [INFO] DihScrapper: Authenticated as BloatWare#2815, listening for new messages
+2026-10-01 14:57:54,457 [INFO] DihScrapper.upload: Appended 1 row(s) across 1 file(s) to myrachane/ScrapedDih@main
+2026-10-01 14:58:07,947 [INFO] DihScrapper: Pushed and verified 1 message(s); local buffer cleared
