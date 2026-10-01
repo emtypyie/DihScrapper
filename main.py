@@ -14,16 +14,9 @@ from pathlib import Path
 
 import discord
 
-from archive_format import (
-    MESSAGE_FIELDS,
-    USER_FIELDS,
-    append_row,
-    message_row,
-    read_rows,
-    rewrite,
-)
+from formatter import USER_MAP_FILE, append_row, message_row, read_rows, rewrite
 from logger import setup_logging
-from uploader import GitHubArchive
+from pusher import ArchiveError, GitHubArchive
 
 # writes the log file; shipping is a separate process so it outlives us
 setup_logging()
@@ -62,12 +55,12 @@ def channel_path(channel: discord.TextChannel) -> Path:
 
 
 def user_map_path(guild: discord.Guild) -> Path:
-    return server_dir(guild) / "user_map.csv"
+    return server_dir(guild) / USER_MAP_FILE
 
 
 def record_users(guild: discord.Guild, messages: list[dict]) -> None:
     path = user_map_path(guild)
-    rows = {row["user_id"]: row for row in read_rows(path, USER_FIELDS)}
+    rows = {row["user_id"]: row for row in read_rows(path)}
     for message in messages:
         name = message.get("author")
         if name:
@@ -75,7 +68,7 @@ def record_users(guild: discord.Guild, messages: list[dict]) -> None:
                 "username": str(name),
                 "user_id": str(message["author_id"]),
             }
-    rewrite(path, USER_FIELDS, sorted(rows.values(), key=lambda r: r["username"].lower()))
+    rewrite(path, sorted(rows.values(), key=lambda r: r["username"].lower()))
 
 
 async def fetch_reference(channel: discord.TextChannel, message_id: int) -> discord.Message | None:
@@ -115,33 +108,40 @@ async def build_message(message: discord.Message) -> dict:
 
 
 async def push_once() -> None:
-    """One cycle: append the buffer, verify, then clear it.
+    """One cycle: stage the buffer into a batch, push it, verify, then clear it.
 
-    Clearing is keyed on the ids actually published, so a message buffered while
+    Clearing is keyed on the ids that were staged, so a message buffered while
     the push is in flight is not in that set and stays on disk. The lock is not
     what makes this safe; it only keeps local file mutations from interleaving.
     """
     try:
         async with _buffer_lock:
-            payloads = archive.pending_payloads()
-
-        published = await archive.publish(payloads=payloads)
-        if not published:
+            batch = archive.stage_batch()
+        if batch is None:
             logger.info("Nothing new to push")
+            return
+
+        published = await archive.publish(batch)
+        if not published:
             return
 
         total = sum(len(ids) for ids in published.values())
         missing = await archive.verify(published)
         if missing:
             logger.error(
-                "Archive is missing %d message(s) after push, keeping local buffer",
-                len(missing),
+                "Batch is not on the branch yet, keeping local buffer: %s",
+                ", ".join(missing[:3]),
             )
             return
 
         async with _buffer_lock:
             archive.clear_published(published)
         logger.info("Pushed and verified %d message(s); local buffer cleared", total)
+    except ArchiveError as exc:
+        # The expected failure mode -- GitHub being slow, throttling or 5xx --
+        # already carries the call, the attempt count and the last error. A
+        # traceback here buried the one useful line under twenty of aiohttp's.
+        logger.error("Push cycle failed, local buffer left intact: %s", exc)
     except Exception:
         # A raised error here would end push_loop and silently stop archiving.
         logger.exception("Push cycle failed, local buffer left intact")
@@ -180,7 +180,7 @@ async def on_message(message: discord.Message) -> None:
     record = await build_message(message)
     row = message_row(record)
     async with _buffer_lock:
-        append_row(channel_path(message.channel), MESSAGE_FIELDS, row)
+        append_row(channel_path(message.channel), row)
         record_users(message.guild, [record])
     logger.debug("Buffered message %s from #%s", message.id, message.channel.name)
 

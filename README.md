@@ -19,9 +19,9 @@ Three properties shape the design:
   the bot connected is ever read. The archive begins when the bot starts.
 - **Media is recorded by reference, never downloaded.** Images, videos, and files are all
   stored as their CDN URL. Nothing is fetched, and nothing but a URL is kept.
-- **The archive is append-only.** Every cycle appends newly captured messages, verifies they
-  landed, and only then clears the local buffer. Nothing in the archive is ever rewritten
-  or deleted, so the local disk is disposable staging and the repository is the record.
+- **The archive only ever grows.** The bot commits new files and never rewrites one; the
+  workflow that merges them adds rows, sorts, and rewrites. No row is dropped and no path is
+  ever deleted, so the local disk is disposable staging and the repository is the record.
 
 Because the archive lives in Git, the scraper can be killed, redeployed, or moved to
 another host and pick up exactly where it left off.
@@ -37,38 +37,73 @@ The bot runs a single event loop over the channels it has been invited to.
    attachment URLs, and four `reply_to_*` columns when the message answers another.
 3. **Track the directory.** Each server keeps a `user_map.csv` of `username,user_id`, keyed
    by ID so a renamed user keeps their history.
-4. **Push, verify, clear.** Every `PUSH_INTERVAL` seconds the buffer is appended to the
-   archive, read back to confirm, and only then cleared.
+4. **Stage, push, verify, clear.** Every `PUSH_INTERVAL` seconds the buffer is copied into a
+   batch under `inbox/`, the batch is committed to the archive, its presence on the branch is
+   confirmed, and only then is the local buffer cleared.
 
 Rows are keyed on message ID throughout, so the whole cycle is idempotent: a retry after a
-failed push re-appends the same rows and changes nothing.
+failed push re-commits the same rows and changes nothing.
 
-## The publish cycle
+## The push cycle
 
 Each interval runs three steps, and the third is gated on the second.
 
-1. **Append.** For every local CSV, read the published copy from the archive, drop any row
-   whose key is already there, sort by ID, and commit the result as one tree and one
-   commit. No deletion entry is ever emitted, so the archive can only grow.
-2. **Verify.** Re-read the archive from GitHub and confirm every key just committed is
-   actually present. Anything missing aborts the cycle.
-3. **Clear.** Remove exactly the rows that were confirmed, by key. A message that arrives
-   mid-cycle is therefore not lost — it is simply not in the cleared set and goes out on
-   the next interval.
+1. **Stage.** The buffered rows are copied into `inbox/<batch id>/`, one file per channel. The
+   batch id is the newest row's timestamp plus a hash of the batch's own bytes, so staging an
+   unchanged buffer twice produces the same path — which is how a push that lost its reply
+   recognises itself.
+2. **Push.** Each batch file is a brand new path, so it is committed as a new blob and a tree
+   entry. No archive file is read, rewritten, or even known to the bot. Every path is new, so
+   this costs a fixed handful of small calls whatever the archive weighs.
+3. **Verify, then clear.** The branch's tree is walked — metadata, not content — to confirm the
+   batch is on it, and only then are exactly those rows removed from the buffer by key. A
+   message that arrives mid-cycle is not in the cleared set, so it goes out next interval.
 
 If step 1 or 2 fails the buffer is left completely intact and the next interval retries.
+
+## Why an inbox
+
+Merging new messages into a transcript means rewriting the whole file, because a git blob is
+content-addressed and immutable: there is no "append eighty bytes to this file" in the object
+model or in GitHub's API. So a scraper that merged inline re-downloaded and re-uploaded every
+channel it touched, every cycle, forever, and a busy channel eventually took longer than any
+sane request timeout.
+
+Splitting the work fixes it without changing what the archive is. The bot only ever adds new
+files, so its cost tracks what just arrived. The rewrite moves to `muncher.py`, run by a
+GitHub Actions job where nothing times out.
+
+## The muncher
+
+`.github/workflows/muncher.yml` runs on any push that touches `inbox/`. It merges every batch
+into the transcripts it names, sorts by ID, deletes the batches, and commits the result. The
+only writer of a transcript is this job.
+
+The workflow lives in the **archive** repository, because that is where the push it reacts to
+happens: a workflow only fires for pushes to its own repository. `archive-repo/` is the copy
+of record for that workflow, and `archive-repo/sync.ps1` installs it — along with `muncher.py`
+and `formatter.py` — into a `ScrapedDih` checkout. Those two scripts are copied rather than
+duplicated so the merge logic has one source; `tests/test_muncher.py` is what proves the copy
+is correct.
+
+- **Idempotent.** Merging by key means a re-run or a manual re-trigger changes nothing.
+- **Append-only.** Rows are only ever added, sorted, and rewritten. No archive path is ever
+  removed, so the archive can only grow.
+- **Serializable.** One `concurrency` group, so two merges can never interleave. The bot also
+  commits to `main`, so the job rebases and re-munches rather than losing that race.
+
+An empty inbox produces no commit, which is what stops the workflow re-triggering itself.
 
 ## Publishing model
 
 Commits are assembled through the GitHub git data API: blobs, then a tree layered on the
 current remote tree, then a commit, then a ref update. Files are hashed the way git hashes
-them, so unchanged content is skipped and a steady-state cycle costs a couple of API calls
-no matter how large the archive grows.
+them, so unchanged content is skipped.
 
 ### Starting from an empty repository
 
 GitHub will not create a blob in a repository that has no commits, so a brand-new archive
-is seeded before its first append. If the repository already has commits but the configured
+is seeded before its first push. If the repository already has commits but the configured
 branch does not, the branch is pointed at the default branch's head instead.
 
 ## Data layout
@@ -76,21 +111,42 @@ branch does not, the branch is pointed at the default branch's head instead.
 In the archive repository:
 
 ```text
-TestServer/
+inbox/                              # batches, each one deleted by the muncher
+└── 20261001T155501Z-ab12cd34/
+    └── TestServer/
+        ├── general.csv
+        └── user_map.csv
+TestServer/                         # transcripts, written only by the muncher
 ├── general.csv
 └── user_map.csv
 ```
 
-Server and channel names are stripped to `[A-Za-z0-9_-]` and capped at 64 characters.
+A batch id is `<newest row, UTC>-<8 hex of the batch's content hash>`. Server and channel names
+are stripped to `[A-Za-z0-9_-]` and capped at 64 characters.
 
-Locally, the same layout, holding only unsent rows:
+If you ever find batches piling up in `inbox/`, the muncher is not keeping up — check the
+Actions tab for a red run, and re-run the job. Nothing is lost while it is down: the bot keeps
+buffering and the batches keep the rows. The bot also logs a warning once more than
+`GITHUB_INBOX_WARN` batches are waiting.
+
+**Reading the archive:** a channel is one CSV, but sort by the `id` column rather than trusting
+file order. Consumers should concatenate a channel's files and sort by `id`; within a file it
+is already sorted.
+
+Locally, `DATA_ROOT` holds only unsent rows plus the batches staged from them:
 
 ```text
 HOME/
-└── [Sanitized_Server_Name]/
-    ├── [Sanitized_Channel_Name].csv
-    └── user_map.csv
+├── [Sanitized_Server_Name]/
+│   ├── [Sanitized_Channel_Name].csv
+│   └── user_map.csv
+└── inbox/
+    └── 20261001T155501Z-ab12cd34/
+        └── [Sanitized_Server_Name]/
+            └── [Sanitized_Channel_Name].csv
 ```
+
+The local `inbox/` is deleted once its batch is confirmed on the branch.
 
 A channel transcript row:
 
@@ -108,7 +164,7 @@ was not a reply.
 | Repository | Visibility | Contents |
 | --- | --- | --- |
 | `DihScrapper` | Public | This code. `HOME/` is gitignored and never enters it. |
-| `ScrapedDih` | Private | The archive. CSV transcripts and user maps. |
+| `ScrapedDih` | Private | The archive. CSV transcripts, user maps, and `inbox/` batches in flight. |
 
 `HOME/` belongs exclusively to the private archive and is gitignored in the code repo.
 The code lives on the main account; the archive lives on whichever account `GITHUB_OWNER`
@@ -168,36 +224,62 @@ All optional — the defaults are fine for most servers.
 | `GITHUB_DATA_REPO` | `ScrapedDih` | Archive repo name. |
 | `GITHUB_BRANCH` | `main` | Archive branch. |
 | `PUSH_INTERVAL` | `300` | Seconds between publishes. |
+| `GITHUB_CONNECT_TIMEOUT` | `20` | Seconds to establish a GitHub connection. |
+| `GITHUB_READ_TIMEOUT` | `120` | Seconds to wait between chunks of a response, not per request. |
+| `GITHUB_API_ATTEMPTS` | `3` | Attempts per GitHub call. Only timeouts, 408/429 and 5xx are retried. |
+| `GITHUB_RETRY_BACKOFF` | `1` | Seconds before the first retry; doubles from there, capped at 15. |
+| `GITHUB_INBOX_WARN` | `20` | Batches allowed to wait in `inbox/` before the bot warns the muncher is behind. |
 
 The bot publishes once on connect and then every `PUSH_INTERVAL` seconds, so a run shorter
 than the interval still leaves its messages in the archive.
 
+### Why the read timeout is not a total
+
+A per-request aggregate timeout fails a slow-but-healthy call for a reason that has nothing to
+do with the network, and retrying it changes nothing. So a call is bounded by a connect
+timeout and a per-chunk read timeout instead: a stalled socket still trips `sock_read`, while
+a large response that is merely slow keeps arriving. Timeouts, 408, 429 and 5xx are retried
+with backoff, and a cycle that still fails keeps the buffer and says which call gave up.
+
+The inbox is what keeps that honest — the bot's requests are all small now, so there is no
+long read left to be patient about.
+
 ## Publishing on demand
 
 ```bash
-python uploader.py             # append, verify, clear, then exit
-python uploader.py --dry-run   # show what would be appended
+python pusher.py             # stage, push, verify, clear, then exit
+python pusher.py --dry-run   # show what would be staged
+python muncher.py            # merge the inbox locally, against a checkout
 ```
 
-Safe to run from anywhere: publishing only ever appends, so an empty local buffer cannot
-damage the archive. It still needs to point at the same `DATA_ROOT` holding the unsent
-rows, so from the container that is:
+Safe to run from anywhere: pushing only ever adds new files, so an empty local buffer cannot
+damage the archive, and a batch that is already there is skipped rather than duplicated. It
+still needs to point at the same `DATA_ROOT` holding the unsent rows, so from the container
+that is:
 
 ```bash
-docker compose exec dihscrapper python uploader.py
+docker compose exec dihscrapper python pusher.py
 ```
+
+`muncher.py` normally runs in CI, not locally: it needs the committed batches and the
+transcripts, which only a checkout has both of.
 
 ## Tests
 
 ```bash
-python tests/test_publish.py
+python tests/test_muncher.py   # merge, dedupe, sort, idempotence
+python tests/test_pusher.py    # stage, push, verify, clear, retries, 404s
+python tests/test_pusher.py --live  # the same cycle against a throwaway real repo
 ```
 
-Creates a throwaway private repository and drives the real append → verify → clear cycle
-against it, asserting that image and video attachments are stored as their URLs, that
-nothing is ever deleted, that a row arriving mid-publish survives the clear, and that a
-re-push of identical rows is a no-op. The repository is deleted afterwards, so the live
-archive is never touched.
+Everything runs offline against a local fake GitHub and a temporary directory. `--live` is the
+exception: it creates a throwaway private repository, drives the real cycle against it, and
+deletes it afterwards, so the live archive is never touched.
+
+`tests/test_muncher.py` is where the interesting assertions now live, because the merge is
+plain filesystem work and no longer needs a network to be tested: a re-delivered row is not
+duplicated, rows sort numerically, `user_map.csv` merges on user id, a second run changes
+nothing, and no archive path ever disappears.
 
 ## Notes
 

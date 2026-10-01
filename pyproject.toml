@@ -1,6 +1,6 @@
 # Ruff config for the BloatWare workflow.
 # line-length 100 matches what this codebase already uses: the pre-existing
-# main.py and uploader.py both have lines up to 99 chars, so the formatter
+# main.py and pusher.py both have lines up to 99 chars, so the formatter
 # default of 88 would rewrite untouched code and fail the gate on files that
 # were never formatted in the first place.
 [tool.ruff]

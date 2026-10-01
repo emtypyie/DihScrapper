@@ -26,7 +26,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from uploader import GITHUB_OWNER, GITHUB_TOKEN, ArchiveError, GitHubArchive
+from pusher import GITHUB_OWNER, GITHUB_TOKEN, ArchiveError, GitHubArchive
 
 load_dotenv()
 
