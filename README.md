@@ -3,7 +3,7 @@
 by emtypyie
 
 Active Discord Chat Scraper to train ML MODELS
-lol.
+lol. <dont try this at your home>
 
 ---
 
