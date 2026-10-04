@@ -108,11 +108,15 @@ token reading a channel it is already a member of; there is no user account auto
 anywhere in this project.
 
 ```bash
-python backfill.py --channel 1234567890                # one channel
-python backfill.py --server 123456789 --list           # what would it cover
-python backfill.py --server 123456789 --limit 500      # newest 500 per channel
-python backfill.py --channel 1234567890 --dry-run      # read and stage, publish nothing
+python backfill.py                                       # every server the bot is in
+python backfill.py --list                                # what that would cover
+python backfill.py --server 123456789 --limit 500        # newest 500 per channel, one server
+python backfill.py --channel 1234567890 --dry-run        # read and stage, publish nothing
 ```
+
+With no arguments it reads everything it can reach: every text channel of every server the
+bot is in. `--server` and `--channel` are the narrower versions of that request, not the
+only way in.
 
 It writes through the same inbox the bot does, which is what makes it safe to point at a
 live archive:
@@ -147,7 +151,24 @@ The `backfill` workflow is manual-only (`workflow_dispatch`) and needs, once:
 | Variable `ARCHIVE_BRANCH` | archive branch, default `main` |
 
 Inputs: `channel_id` (comma separated, threads welcome), `server_id` (every readable text
-channel), `limit` (0 for all), `resolve_replies`, `delay`, `list_only`.
+channel), `limit` (0 for all), `resolve_replies`, `delay`, `list_only`. Leave both id boxes
+empty to sweep every server, same as a bare `python backfill.py`.
+
+### How it finds the channels
+
+Naming channels is easy; listing a server's channels is a privilege, and there are two ways
+to ask:
+
+- **The gateway**, which is tried first. Every member's channel list arrives in
+  `GUILD_CREATE` whether or not the bot can administer the server. The connection is made
+  for a few seconds, the list is taken, and it is dropped — so a long run holds no live
+  message cache.
+- **`GET /guilds/{id}/channels`**, used when the gateway will not connect. This one needs
+  **Manage Channels**, and answers 403 without it.
+
+If neither works the error says so, and names the two ways forward: grant Manage Channels,
+or pass `--channel` for the channels you care about. The server list itself is plain REST
+(`GET /users/@me/guilds`) and always available.
 
 It publishes over the API with the PAT, so the workflow itself needs no write permission on
 this repository. It is serialized with the bot only by GitHub's per-repo limits and the
@@ -160,8 +181,10 @@ the ref moved re-reads it rather than forcing.
   resolved with no extra request. One whose parent is further back is left empty unless
   `--resolve-replies` is set, which costs one API call per such reply.
 - **Threads only by id.** A thread id works in `channel_id`. Listing every thread in a
-  server needs the archived-threads API, which needs admin, so `--server` covers text
-  channels.
+  server needs the archived-threads API, which needs admin, so a server-wide run covers text
+  channels and leaves threads to `--channel`. Two threads in one server can share a name, and
+  a transcript is named after it, so sweeping them in would have two conversations writing to
+  one file.
 - **It cannot read what Discord will not serve.** A guild that restricts the bot, or a
   channel it cannot see, is refused with the reason; in a server-wide run that channel is
   skipped and the run continues.

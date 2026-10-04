@@ -61,6 +61,9 @@ CHUNK = int(os.environ.get("BACKFILL_CHUNK", "10000"))
 # politeness between pages, not a correctness requirement.
 PAGE_SIZE = 100
 PAGE_DELAY = float(os.environ.get("BACKFILL_DELAY", "0"))
+# How long to wait for the gateway handshake before giving up on it and asking REST.
+# A blocked socket fails fast; a black-holed one is the reason this is bounded.
+GATEWAY_PROBE_TIMEOUT = 45
 
 
 class BackfillError(RuntimeError):
@@ -207,26 +210,131 @@ async def backfill_channel(
     return stats
 
 
-async def backfill_guild(
-    bot: discord.Client,
-    archive: GitHubArchive,
-    guild: discord.Guild,
-    **kwargs,
-) -> Stats:
-    """Every text channel in a server, oldest id first for a reproducible order.
+def _text_channels(raw_channels: list[dict]) -> list[tuple[int, str]]:
+    """(id, name) for the plain text channels, oldest id first.
 
-    A channel the bot cannot read is logged and skipped rather than ending the
-    run: a server has hundreds of them and one missing permission is not a reason
-    to abandon the rest.
+    Threads are left out on purpose: one cannot be backfilled by id without
+    guessing it, and GUILD_CREATE only carries the threads the bot already sits
+    in. Category type 4 is Discord's; 0 is text, and the rest are voice, stage,
+    forum, announcement-with-attachments and the like, none of which have a
+    message history to read as a transcript.
     """
-    total = Stats()
-    for channel in sorted(guild.text_channels, key=lambda item: item.id):
-        try:
-            total.add(await backfill_channel(bot, archive, channel, **kwargs))
-        except BackfillError as exc:
-            total.failures += 1
-            logger.warning("%s -- skipping this channel", exc)
-    return total
+    targets = [
+        (int(channel["id"]), str(channel.get("name") or channel["id"]))
+        for channel in raw_channels
+        if channel.get("type") == 0
+    ]
+    return sorted(targets, key=lambda target: target[0])
+
+
+async def _channels_from_gateway(
+    token: str, guild_ids: list[str]
+) -> dict[str, list[tuple[int, str]]] | None:
+    """Channel lists straight from GUILD_CREATE, or None if that is not possible.
+
+    The gateway is the one place a member's channel list arrives without a
+    privilege, but a websocket is a thing that can be blocked or throttled, and a
+    host may reach the REST API perfectly well while the socket does not -- so
+    failure here is a fallback, not an error. It is also short: the lists are
+    taken and the connection dropped, which keeps a long backfill free of the
+    message cache a live connection would build.
+    """
+    probe = discord.Client(intents=discord.Intents.none())
+    try:
+        await probe.login(token)
+        await probe.connect()
+        await asyncio.wait_for(probe.wait_until_ready(), GATEWAY_PROBE_TIMEOUT)
+        listed: dict[str, list[tuple[int, str]]] = {}
+        for guild_id in guild_ids:
+            guild = probe.get_guild(int(guild_id))
+            if guild is None:
+                logger.warning("server %s: the bot is not in it", guild_id)
+                listed[guild_id] = []
+                continue
+            listed[guild_id] = _text_channels(
+                [
+                    {"id": channel.id, "name": channel.name, "type": channel.type.value}
+                    for channel in guild.channels
+                ]
+            )
+        return listed
+    except (OSError, asyncio.TimeoutError, discord.LoginFailure, discord.HTTPException) as exc:
+        logger.warning("gateway channel list failed (%s: %s)", type(exc).__name__, exc)
+        return None
+    finally:
+        await probe.close()
+
+
+async def _channels_from_rest(token: str, guild_id: str) -> list[tuple[int, str]]:
+    """The server's text channels over REST, which needs Manage Channels.
+
+    The fallback for a gateway that will not connect. Its 403 against a bot
+    without that permission is the same answer as a member not being in the
+    server, so both failures are reported as the one thing the operator can act
+    on: grant Manage Channels, or pass --channel for the channels that matter.
+    """
+    rest = discord.Client(intents=discord.Intents.none())
+    try:
+        await rest.login(token)
+        channels = await rest.http.get_all_guild_channels(int(guild_id))
+        return _text_channels(list(channels))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+        raise BackfillError(
+            f"cannot list the channels of server {guild_id} ({exc}); give the bot "
+            "Manage Channels so the list can be read, or pass --channel <id>"
+        ) from exc
+    finally:
+        await rest.close()
+
+
+def _server_list(raw_guilds: list[dict]) -> list[tuple[str, str]]:
+    """(id, name) per server, oldest id first.
+
+    Numeric, not lexicographic: as strings "99" sorts after
+    "1215905413363531817", which would reorder a run for no reason.
+    """
+    return sorted(
+        ((str(int(guild["id"])), str(guild.get("name") or guild["id"])) for guild in raw_guilds),
+        key=lambda guild: int(guild[0]),
+    )
+
+
+async def bot_servers(token: str) -> list[tuple[str, str]]:
+    """(id, name) for every server the bot is in, oldest id first.
+
+    This one is plain REST and always available: ``GET /users/@me/guilds`` is the
+    bot's own membership, not a privilege over anyone else's server.
+    """
+    client = discord.Client(intents=discord.Intents.none())
+    try:
+        await client.login(token)
+        guilds = await client.http.get_guilds(200, with_counts=False)
+        return _server_list(list(guilds))
+    except discord.HTTPException as exc:
+        raise BackfillError(f"cannot list the bot's servers: {exc}") from exc
+    finally:
+        await client.close()
+
+
+async def server_text_channels(
+    token: str, guild_ids: list[str]
+) -> dict[str, list[tuple[int, str]]]:
+    """Text channels per server id, oldest id first, for each id that could be listed.
+
+    One gateway connection covers every server asked for: the handshake is the
+    expensive part, and the snapshot is taken from what is already in memory.
+    """
+    wanted = [guild_id for guild_id in guild_ids]
+    found = await _channels_from_gateway(token, wanted)
+    if found is None:
+        logger.info("gateway unavailable; asking REST for the channel lists")
+        for guild_id in wanted:
+            try:
+                found[guild_id] = await _channels_from_rest(token, guild_id)
+            except BackfillError as exc:
+                logger.warning("%s", exc)
+                found[guild_id] = []
+    return found
 
 
 async def fetch_channel(bot: discord.Client, channel_id: str) -> discord.abc.GuildChannel:
@@ -241,32 +349,46 @@ async def fetch_channel(bot: discord.Client, channel_id: str) -> discord.abc.Gui
     return channel
 
 
-async def fetch_guild(bot: discord.Client, guild_id: str) -> discord.Guild:
-    try:
-        return await bot.fetch_guild(int(guild_id))
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-        raise BackfillError(
-            f"cannot open server {guild_id}: the bot is not a member of it ({exc})"
-        ) from exc
+async def backfill_channels(
+    bot: discord.Client, archive: GitHubArchive, targets: list[tuple[int, str]], **kwargs
+) -> Stats:
+    """Each (id, name) in turn, oldest id first for a reproducible order.
+
+    A channel the bot cannot read is logged and skipped rather than ending the
+    run: a server has hundreds of them and one missing permission is not a reason
+    to abandon the rest.
+    """
+    total = Stats()
+    for channel_id, name in targets:
+        try:
+            channel = await fetch_channel(bot, str(channel_id))
+            total.add(await backfill_channel(bot, archive, channel, **kwargs))
+        except BackfillError as exc:
+            total.failures += 1
+            logger.warning("#%s (%s) -- skipping this channel", name, channel_id, exc)
+    return total
 
 
-async def list_channels(bot: discord.Client, guild: discord.Guild) -> None:
-    """Report what a backfill of this server would cover, archiving nothing.
+async def list_channels(bot: discord.Client, targets: list[tuple[int, str | None]]) -> None:
+    """Report what a backfill of these channels would cover, archiving nothing.
 
     Readability is probed with a one-message history call rather than a permission
     lookup, because computing permissions needs a member cache this process
-    deliberately does not build.
+    deliberately does not build. A target named ``None`` is a bare id from
+    ``--channel``, which has no name until it is opened.
     """
-    for channel in sorted(guild.text_channels, key=lambda item: item.id):
+    for channel_id, name in targets:
+        label = name or channel_id
         try:
+            channel = await fetch_channel(bot, str(channel_id))
             page = await read_page(channel, 1, None)
         except BackfillError as exc:
-            logger.warning("#%s: %s", channel.name, exc)
+            logger.warning("#%s: %s", label, exc)
             continue
         logger.info(
             "#%s (%s): readable, %s",
-            channel.name,
-            channel.id,
+            channel.name or label,
+            channel_id,
             "history available" if page else "no messages",
         )
 
@@ -275,11 +397,6 @@ async def run(args: argparse.Namespace) -> int:
     token = os.environ.get("DISCORD_API") or os.environ.get("DISCORD_TOKEN")
     if not token:
         raise SystemExit("DISCORD_API is not set")
-    if not args.channel and not args.server:
-        raise SystemExit("nothing to do: pass --channel, --server, or both")
-    if args.list and not args.server:
-        # better a refusal than a full backfill from someone who meant to preview one
-        raise SystemExit("--list works with --server; name the server to report on")
 
     # No ceiling: a run reads the whole channel, or as much of it as the token, the
     # runner and the clock allow. --limit is there for a deliberate partial read, not
@@ -296,24 +413,55 @@ async def run(args: argparse.Namespace) -> int:
         await bot.login(token)
         logger.info("Authenticated as %s", bot.user)
 
+        # No arguments means every server the bot is in: the ordinary request is
+        # "archive the history", and naming a server or a channel is the narrower
+        # version of it, not the only way in.
         if args.server:
-            guild = await fetch_guild(bot, args.server)
-            if args.list:
-                await list_channels(bot, guild)
-                return 0
-            total.add(
-                await backfill_guild(
-                    bot,
-                    archive,
-                    guild,
-                    limit=limit,
-                    resolve_replies=args.resolve_replies,
-                    delay=args.delay,
-                    dry_run=args.dry_run,
-                )
+            servers = [(args.server, None)]
+        elif not args.channel:
+            servers = await bot_servers(token)
+            logger.info(
+                "no server or channel named: %s server(s) -- %s",
+                len(servers),
+                ", ".join(name for _, name in servers),
             )
+        else:
+            servers = []
+
+        if servers:
+            listed = await server_text_channels(token, [guild_id for guild_id, _ in servers])
+            for guild_id, name in servers:
+                targets = listed.get(guild_id, [])
+                logger.info(
+                    "server %s%s: %s text channel(s)",
+                    guild_id,
+                    f" ({name})" if name else "",
+                    len(targets),
+                )
+                if not targets:
+                    total.failures += 1
+                    continue
+                if args.list:
+                    await list_channels(bot, targets)
+                    continue
+                total.add(
+                    await backfill_channels(
+                        bot,
+                        archive,
+                        targets,
+                        limit=limit,
+                        resolve_replies=args.resolve_replies,
+                        delay=args.delay,
+                        dry_run=args.dry_run,
+                    )
+                )
+            if args.list:
+                return 0
 
         for channel_id in args.channel:
+            if args.list:
+                await list_channels(bot, [(int(channel_id), None)])
+                continue
             try:
                 channel = await fetch_channel(bot, channel_id)
                 total.add(
@@ -330,6 +478,8 @@ async def run(args: argparse.Namespace) -> int:
             except BackfillError as exc:
                 total.failures += 1
                 logger.error("%s", exc)
+        if args.list:
+            return 0
     finally:
         if not bot.is_closed():
             await bot.close()
@@ -348,7 +498,8 @@ async def run(args: argparse.Namespace) -> int:
 def main() -> int:
     setup_logging()
     parser = argparse.ArgumentParser(
-        description="Read a channel's Discord history and append it to the archive.",
+        description="Read Discord history and append it to the archive. With no arguments, "
+        "every text channel of every server the bot is in.",
         epilog="The archive is only appended to; overlapping the bot's live capture "
         "is deduplicated by message id rather than duplicated.",
     )
@@ -359,7 +510,11 @@ def main() -> int:
         metavar="ID",
         help="channel or thread id to backfill; repeatable",
     )
-    parser.add_argument("--server", metavar="ID", help="backfill every text channel in this server")
+    parser.add_argument(
+        "--server",
+        metavar="ID",
+        help="backfill every text channel in this server (default: all of them)",
+    )
     parser.add_argument(
         "--limit",
         type=int,
@@ -382,7 +537,7 @@ def main() -> int:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="with --server, report which channels are readable and archive nothing",
+        help="report which channels are readable and archive nothing",
     )
     parser.add_argument(
         "--dry-run",

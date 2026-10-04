@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       channel_id:
-        description: 'Channel or thread id to backfill, comma separated. Leave empty to use --server.'
+        description: 'Channel or thread id to backfill, comma separated. Empty means every server.'
         required: false
         type: string
       server_id:
@@ -92,8 +92,7 @@ jobs:
           if [ -z "${GITHUB_OWNER}" ]; then echo "::error::ARCHIVE_OWNER variable is not set"; missing=1; fi
           if [ -z "${GITHUB_DATA_REPO}" ]; then echo "::error::ARCHIVE_REPO variable is not set"; missing=1; fi
           if [ -z "${{ inputs.channel_id }}" ] && [ -z "${{ inputs.server_id }}" ]; then
-            echo "::error::set channel_id, server_id, or both"
-            missing=1
+            echo "no channel_id or server_id: every server the bot is in"
           fi
           exit "$missing"
 

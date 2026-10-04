@@ -49,11 +49,29 @@ REPO_CREATE_ATTEMPTS = 10
 REPO_CREATE_DELAY = 1.0
 
 
+def _widen_console() -> None:
+    """Let the console hold a channel name.
+
+    A Windows console defaults to cp1252, and one of the servers this bot is in
+    has a name outside it. Logging that name then raises UnicodeEncodeError from
+    inside the logging handler, which takes the run down over a cosmetic fault.
+    The file handler is utf-8 either way; only the terminal needed widening.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def setup_logging(name: str = LOG_NAME, log_dir: Path | None = None) -> Path:
     # Defaults to the bot's log, not the shipper's. The shipper passes
     # SHIPPER_LOG_NAME explicitly: two processes rotating one file is unsafe,
     # and the bot has no reason to write to the shipper's log.
     # RotatingFileHandler flushes per emit, so no buffered lines are lost.
+    _widen_console()
     directory = Path(log_dir or LOG_DIR)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name

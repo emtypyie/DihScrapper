@@ -452,6 +452,98 @@ async def scenario_dry_run() -> list[str]:
     return failures
 
 
+async def scenario_server() -> list[str]:
+    failures: list[str] = []
+
+    def check(label: str, condition: bool) -> None:
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures.append(label)
+
+    archive, scratch = harness(page_size=100, chunk=10_000)
+    try:
+        guild = SimpleNamespace(name="Test Server")
+        general = FakeChannel("general", guild, [message(1), message(2)])
+        locked = FakeChannel("locked", guild, [message(3)], forbidden=True)
+        memes = FakeChannel("memes", guild, [message(4), message(5), message(6)])
+        by_id = {10: general, 11: locked, 12: memes}
+
+        async def fetch_channel(_channel_id: int):
+            if _channel_id not in by_id:
+                raise discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not Found"), "Unknown Channel"
+                )
+            channel = by_id[_channel_id]
+            if channel.forbidden:
+                raise discord.Forbidden(
+                    SimpleNamespace(status=403, reason="Forbidden"), "Missing Access"
+                )
+            return channel
+
+        bot = SimpleNamespace(user=SimpleNamespace(id=BOT_ID), fetch_channel=fetch_channel)
+        targets = [(10, "general"), (11, "locked"), (99, "deleted"), (12, "memes")]
+        stats = await backfill.backfill_channels(bot, archive, targets, limit=0)
+
+        check(
+            "a channel that cannot be opened is counted, not fatal",
+            stats.failures == 2 and stats.channels == 2,
+        )
+        check("a deleted channel id does not end the run", stats.rows == 5)
+
+        munch(archive.root / INBOX_DIR, archive.root)
+        check(
+            "the readable channels either side of it are still archived",
+            ids_of(archive.root / TRANSCRIPT) == ["1", "2"]
+            and ids_of(archive.root / f"{SERVER}/memes.csv") == ["4", "5", "6"],
+        )
+    finally:
+        scratch.cleanup()
+
+    return failures
+
+
+async def scenario_selection() -> list[str]:
+    """What a bare run covers, and which channels a server sweep picks out."""
+    failures: list[str] = []
+
+    def check(label: str, condition: bool) -> None:
+        print(f"{'PASS' if condition else 'FAIL'}  {label}")
+        if not condition:
+            failures.append(label)
+
+    raw = [
+        {"id": "30", "name": "general", "type": 0},
+        {"id": "10", "name": "older", "type": 0},
+        {"id": "20", "name": "Voice", "type": 2},
+        {"id": "40", "name": "Forum", "type": 15},
+        {"id": "50", "name": "Category", "type": 4},
+    ]
+    check(
+        "text channels only, oldest id first",
+        backfill._text_channels(raw) == [(10, "older"), (30, "general")],
+    )
+    check(
+        "an unnamed channel still names something",
+        backfill._text_channels([{"id": "60", "type": 0}]) == [(60, "60")],
+    )
+
+    guilds = [
+        {"id": "1215905413363531817", "name": "Otaku Valley"},
+        {"id": "99", "name": "A Server"},
+    ]
+    ordered = backfill._server_list(guilds)
+    check(
+        "servers come back oldest id first, numerically",
+        [name for _, name in ordered] == ["A Server", "Otaku Valley"],
+    )
+    check(
+        "an unnamed server still names something",
+        backfill._server_list([{"id": "5"}]) == [("5", "5")],
+    )
+
+    return failures
+
+
 async def main() -> int:
     failures = scenario_names()
     print()
@@ -466,6 +558,10 @@ async def main() -> int:
     failures += await scenario_chunking()
     print()
     failures += await scenario_overlap()
+    print()
+    failures += await scenario_server()
+    print()
+    failures += await scenario_selection()
     print()
     failures += await scenario_dry_run()
     print()
