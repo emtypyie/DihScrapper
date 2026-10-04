@@ -10,6 +10,9 @@ Merging the inbox into the archive CSVs is ``muncher.py``'s job, run by
 every week, and that belongs in a CI job with no request timeout rather than in
 the bot's five minute loop.
 
+``backfill.py`` publishes the same batches from history it has just read, so it
+does not care how large the archive is either.
+
 Also usable on its own::
 
     python pusher.py            # stage, push, verify, then clear, and exit
@@ -519,6 +522,33 @@ class GitHubArchive:
             logger.info("Ref %s already points at %s", self.branch, commit_sha)
 
 
+async def publish_batch(
+    archive: GitHubArchive, batch: Batch, dry_run: bool = False
+) -> dict[str, list[str]]:
+    """Push a staged batch and confirm it landed, returning its staged keys.
+
+    The three writers -- the bot's loop, ``python pusher.py`` and ``backfill.py``
+    -- all push a batch they did not stage themselves, so the cycle they share
+    lives here. Clearing is deliberately left to the caller: the bot clears under
+    its buffer lock, and a backfill clears between chunks.
+
+    A batch that is not on the branch after the push raises, with the buffer
+    untouched. The rows are then still on disk and still in the batch, which is the
+    only safe state to be in when a push did not land.
+    """
+    published = await archive.publish(batch, dry_run=dry_run)
+    if dry_run or not published:
+        return published
+
+    missing = await archive.verify(published)
+    if missing:
+        raise ArchiveError(
+            f"{len(missing)} batch file(s) missing from the archive after push, "
+            f"local buffer left intact: {missing[:5]}"
+        )
+    return published
+
+
 async def _run(args: argparse.Namespace) -> None:
     archive = GitHubArchive()
     try:
@@ -526,19 +556,13 @@ async def _run(args: argparse.Namespace) -> None:
         if batch is None:
             logger.info("Nothing new to push")
             return
-        published = await archive.publish(batch, dry_run=args.dry_run)
+        published = await publish_batch(archive, batch, dry_run=args.dry_run)
         total = sum(len(ids) for ids in published.values())
         if args.dry_run:
             logger.info("[dry-run] %d row(s) would be pushed", total)
             return
         if not published:
             return
-        missing = await archive.verify(published)
-        if missing:
-            raise ArchiveError(
-                f"{len(missing)} batch file(s) missing from the archive after push, "
-                f"local buffer left intact: {missing[:5]}"
-            )
         archive.clear_published(published)
         logger.info("Pushed and verified %d row(s); local buffer cleared", total)
     except ArchiveError as exc:

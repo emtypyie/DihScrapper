@@ -1,0 +1,145 @@
+# Backfill: read a channel's Discord history and append it to the archive.
+#
+# Manual only. A backfill is opt-in because it costs the bot's token rate limit,
+# and because "how much history" is a decision, not a default. The live bot keeps
+# archiving throughout -- this only ever adds new files under inbox/, and the
+# muncher in ScrapedDih merges them keyed on message id, so anything the bot
+# already captured is deduplicated rather than duplicated.
+#
+# It belongs here rather than in the archive repo for the same reason the bot
+# lives here: it needs DISCORD_API and GITHUB_TOKEN, and it reads this code. It
+# publishes over the GitHub API with a PAT, so it needs no write permission from
+# this repository -- contents: read is only for the checkout.
+#
+# Maintainer-owned: RULEBOOK rule 2 keeps .github/workflows/ out of contributor PRs.
+name: backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_id:
+        description: 'Channel or thread id to backfill, comma separated. Leave empty to use --server.'
+        required: false
+        type: string
+      server_id:
+        description: 'Server id to backfill in full, every text channel the bot can read.'
+        required: false
+        type: string
+      limit:
+        description: 'Messages per channel. 0 reads all of it, with no cap.'
+        required: false
+        default: '0'
+        type: string
+      resolve_replies:
+        description: 'Fetch reply parents older than the page in hand. One API call each.'
+        required: false
+        default: false
+        type: boolean
+      delay:
+        description: 'Seconds between history pages. Raise this if Discord throttles.'
+        required: false
+        default: '0'
+        type: string
+      list_only:
+        description: 'Report which channels are readable, archive nothing.'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Two backfills must never interleave: both push to the same branch, and one
+# would spend its whole budget re-pushing batches the other just landed. Not
+# cancelled either -- the running one is pushing rows the next one would re-fetch.
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    # There is no row cap: a run reads the whole channel. This is the ceiling on
+    # that, and chunking is why hitting it costs a re-run rather than the work --
+    # every batch already pushed is merged and settled by then.
+    timeout-minutes: 180
+    env:
+      DISCORD_API: ${{ secrets.DISCORD_API }}
+      GITHUB_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+      GITHUB_OWNER: ${{ vars.ARCHIVE_OWNER }}
+      GITHUB_DATA_REPO: ${{ vars.ARCHIVE_REPO }}
+      GITHUB_BRANCH: ${{ vars.ARCHIVE_BRANCH }}
+      # nothing local survives the runner, and it only ever holds unsent rows
+      DATA_ROOT: ${{ runner.temp }}/HOME
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Check configuration
+        run: |
+          set -euo pipefail
+          missing=0
+          if [ -z "${DISCORD_API}" ]; then echo "::error::DISCORD_API secret is not set"; missing=1; fi
+          if [ -z "${GITHUB_TOKEN}" ]; then echo "::error::ARCHIVE_TOKEN secret is not set"; missing=1; fi
+          if [ -z "${GITHUB_OWNER}" ]; then echo "::error::ARCHIVE_OWNER variable is not set"; missing=1; fi
+          if [ -z "${GITHUB_DATA_REPO}" ]; then echo "::error::ARCHIVE_REPO variable is not set"; missing=1; fi
+          if [ -z "${{ inputs.channel_id }}" ] && [ -z "${{ inputs.server_id }}" ]; then
+            echo "::error::set channel_id, server_id, or both"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Backfill
+        run: |
+          set -euo pipefail
+          mkdir -p "$DATA_ROOT"
+
+          args=()
+          # a comma separated box is friendlier than one field per channel; the
+          # ids themselves contain no spaces or commas
+          if [ -n "${{ inputs.channel_id }}" ]; then
+            while read -r id; do
+              if [ -n "$id" ]; then
+                args+=(--channel "$id")
+              fi
+            done < <(printf '%s' '${{ inputs.channel_id }}' | tr ',' '\n')
+          fi
+          if [ -n "${{ inputs.server_id }}" ]; then
+            args+=(--server '${{ inputs.server_id }}')
+          fi
+          args+=(--limit '${{ inputs.limit }}' --delay '${{ inputs.delay }}')
+          if [ '${{ inputs.resolve_replies }}' = 'true' ]; then
+            args+=(--resolve-replies)
+          fi
+          if [ '${{ inputs.list_only }}' = 'true' ]; then
+            args+=(--list)
+          fi
+
+          echo "backfill.py ${args[*]}"
+          python backfill.py "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/backfill.log"
+
+      - name: Summarise
+        if: always()
+        run: |
+          # the log is the only record of what a run covered, and the runner throws
+          # it away otherwise. The rows themselves are not here to be collected:
+          # they are in the archive repo, one commit per batch, named by the run.
+          test -f "$RUNNER_TEMP/backfill.log" || exit 0
+          tail -n 40 "$RUNNER_TEMP/backfill.log" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-log
+          path: ${{ runner.temp }}/backfill.log
+          if-no-files-found: ignore
+          retention-days: 7

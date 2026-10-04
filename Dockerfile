@@ -15,7 +15,7 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py pusher.py formatter.py logger.py ./
+COPY main.py pusher.py formatter.py logger.py capture.py backfill.py ./
 RUN mkdir -p /app/HOME /app/LOGS
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \

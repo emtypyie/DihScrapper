@@ -15,8 +15,10 @@ itself current.
 
 Three properties shape the design:
 
-- **It captures the live stream only.** There is no backfill. Nothing that was said before
-  the bot connected is ever read. The archive begins when the bot starts.
+- **The bot captures the live stream only.** `main.py` never looks back: nothing said
+  before it connected is read by it. History is a separate program you run on purpose,
+  because a backfill costs rate limit and *how much* should be a decision rather than a
+  default — see [Backfilling history](#backfilling-history).
 - **Media is recorded by reference, never downloaded.** Images, videos, and files are all
   stored as their CDN URL. Nothing is fetched, and nothing but a URL is kept.
 - **The archive only ever grows.** The bot commits new files and never rewrites one; the
@@ -93,6 +95,80 @@ is correct.
   commits to `main`, so the job rebases and re-munches rather than losing that race.
 
 An empty inbox produces no commit, which is what stops the workflow re-triggering itself.
+
+## Backfilling history
+
+`main.py` archives what arrives after it connects. `backfill.py` reads what came before,
+and it runs only when you ask for it: **Actions → backfill → Run workflow**, or from a
+shell.
+
+The bot needs no special permission for this and no user token — a bot with **Read
+Message History** can read a channel's history over the REST API. This is the bot's own
+token reading a channel it is already a member of; there is no user account automation
+anywhere in this project.
+
+```bash
+python backfill.py --channel 1234567890                # one channel
+python backfill.py --server 123456789 --list           # what would it cover
+python backfill.py --server 123456789 --limit 500      # newest 500 per channel
+python backfill.py --channel 1234567890 --dry-run      # read and stage, publish nothing
+```
+
+It writes through the same inbox the bot does, which is what makes it safe to point at a
+live archive:
+
+- It never rewrites a transcript, so a backfill costs what it read rather than what the
+  archive weighs.
+- Rows it fetches that the bot already captured are deduplicated by the muncher on
+  message id, not duplicated. Overlapping the live capture is free, so a backfill can
+  run while the bot is going.
+- Re-running the same backfill adds nothing. The transcript comes out byte-identical,
+  because a merge with no new rows does not rewrite the file.
+- History is sorted into place, so a transcript still reads oldest-first afterwards. Read
+  by the `id` column either way.
+
+History is read 100 messages at a time and staged in batches of `BACKFILL_CHUNK` rows.
+Every batch is one push, and that push is what makes the muncher merge those rows into the
+transcripts on the archive's `main` — so **the archive is whole every 10k rows**, not just
+at the end of a run, and a run that dies halfway leaves its earlier batches merged. There
+is no cap on the read: `--limit` is there for a deliberate partial read, not as a safety
+stop.
+
+### Running it from Actions
+
+The `backfill` workflow is manual-only (`workflow_dispatch`) and needs, once:
+
+| | |
+| --- | --- |
+| Secret `DISCORD_API` | the bot token |
+| Secret `ARCHIVE_TOKEN` | PAT with `repo` scope on the archive account |
+| Variable `ARCHIVE_OWNER` | archive repo owner |
+| Variable `ARCHIVE_REPO` | archive repo name, e.g. `ScrapedDih` |
+| Variable `ARCHIVE_BRANCH` | archive branch, default `main` |
+
+Inputs: `channel_id` (comma separated, threads welcome), `server_id` (every readable text
+channel), `limit` (0 for all), `resolve_replies`, `delay`, `list_only`.
+
+It publishes over the API with the PAT, so the workflow itself needs no write permission on
+this repository. It is serialized with the bot only by GitHub's per-repo limits and the
+ref check in `pusher.py`: two writers cannot lose each other's rows, and a run that finds
+the ref moved re-reads it rather than forcing.
+
+### What a backfill will not do
+
+- **Reply columns are best-effort.** A reply whose parent is in the page being read is
+  resolved with no extra request. One whose parent is further back is left empty unless
+  `--resolve-replies` is set, which costs one API call per such reply.
+- **Threads only by id.** A thread id works in `channel_id`. Listing every thread in a
+  server needs the archived-threads API, which needs admin, so `--server` covers text
+  channels.
+- **It cannot read what Discord will not serve.** A guild that restricts the bot, or a
+  channel it cannot see, is refused with the reason; in a server-wide run that channel is
+  skipped and the run continues.
+- **Deleted messages stay gone.** History before the bot joined is as good as Discord's
+  retention, no more.
+- **An unreadable channel does not fail the run**, unless nothing at all could be read —
+  otherwise every server with one private channel would paint each run red.
 
 ## Publishing model
 
@@ -229,6 +305,9 @@ All optional — the defaults are fine for most servers.
 | `GITHUB_API_ATTEMPTS` | `3` | Attempts per GitHub call. Only timeouts, 408/429 and 5xx are retried. |
 | `GITHUB_RETRY_BACKOFF` | `1` | Seconds before the first retry; doubles from there, capped at 15. |
 | `GITHUB_INBOX_WARN` | `20` | Batches allowed to wait in `inbox/` before the bot warns the muncher is behind. |
+| `BACKFILL_LIMIT` | `0` | Messages per channel for a backfill; 0 means the whole channel, uncapped. |
+| `BACKFILL_CHUNK` | `10000` | Rows per inbox batch during a backfill, and so the merge cadence. |
+| `BACKFILL_DELAY` | `0` | Seconds between history pages. Raise it if Discord throttles. |
 
 The bot publishes once on connect and then every `PUSH_INTERVAL` seconds, so a run shorter
 than the interval still leaves its messages in the archive.
@@ -250,6 +329,7 @@ long read left to be patient about.
 python pusher.py             # stage, push, verify, clear, then exit
 python pusher.py --dry-run   # show what would be staged
 python muncher.py            # merge the inbox locally, against a checkout
+python backfill.py --help    # read history and append it (see above)
 ```
 
 Safe to run from anywhere: pushing only ever adds new files, so an empty local buffer cannot
@@ -267,8 +347,9 @@ transcripts, which only a checkout has both of.
 ## Tests
 
 ```bash
-python tests/test_muncher.py   # merge, dedupe, sort, idempotence
-python tests/test_pusher.py    # stage, push, verify, clear, retries, 404s
+python tests/test_muncher.py     # merge, dedupe, sort, idempotence
+python tests/test_pusher.py      # stage, push, verify, clear, retries, 404s
+python tests/test_backfill.py    # history paging, chunking, replies, append-not-duplicate
 python tests/test_pusher.py --live  # the same cycle against a throwaway real repo
 ```
 
