@@ -7,16 +7,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import signal
 import time
 from pathlib import Path
 
 import discord
 
-from formatter import USER_MAP_FILE, append_row, message_row, read_rows, rewrite
+from capture import build_message
+from formatter import (
+    USER_MAP_FILE,
+    append_row,
+    merge_user_map,
+    message_row,
+    sanitize_name,
+)
 from logger import setup_logging
-from pusher import ArchiveError, GitHubArchive
+from pusher import ArchiveError, GitHubArchive, publish_batch
 
 # writes the log file; shipping is a separate process so it outlives us
 setup_logging()
@@ -27,10 +33,10 @@ PUSH_INTERVAL = int(os.environ.get("PUSH_INTERVAL", "300"))
 
 intents = discord.Intents.default()
 intents.message_content = True
-# members stays off on purpose. It is never queried: record_users builds its map
-# from the author data already in the message payload. Enabling it makes discord.py
-# cache every member of every guild for the process lifetime, which is unbounded
-# and was a prime suspect for the OOM kills seen next to a second bot on the host.
+# members stays off on purpose. It is never queried: the user map is built from the
+# author data already in the message payload. Enabling it makes discord.py cache
+# every member of every guild for the process lifetime, which is unbounded and was
+# a prime suspect for the OOM kills seen next to a second bot on the host.
 bot = discord.Client(intents=intents)
 
 archive = GitHubArchive(data_root=DATA_ROOT)
@@ -39,72 +45,17 @@ _push_task: asyncio.Task[None] | None = None
 # on_message and the publish cycle both mutate these files, so serialise them.
 _buffer_lock = asyncio.Lock()
 
-_unsafe = re.compile(r"[^A-Za-z0-9_-]")
-
-
-def sanitize(name: str) -> str:
-    return _unsafe.sub("_", name).strip("_")[:64] or "unnamed"
-
 
 def server_dir(guild: discord.Guild) -> Path:
-    return DATA_ROOT / sanitize(guild.name)
+    return DATA_ROOT / sanitize_name(guild.name)
 
 
 def channel_path(channel: discord.TextChannel) -> Path:
-    return server_dir(channel.guild) / f"{sanitize(channel.name)}.csv"
+    return server_dir(channel.guild) / f"{sanitize_name(channel.name)}.csv"
 
 
 def user_map_path(guild: discord.Guild) -> Path:
     return server_dir(guild) / USER_MAP_FILE
-
-
-def record_users(guild: discord.Guild, messages: list[dict]) -> None:
-    path = user_map_path(guild)
-    rows = {row["user_id"]: row for row in read_rows(path)}
-    for message in messages:
-        name = message.get("author")
-        if name:
-            rows[str(message["author_id"])] = {
-                "username": str(name),
-                "user_id": str(message["author_id"]),
-            }
-    rewrite(path, sorted(rows.values(), key=lambda r: r["username"].lower()))
-
-
-async def fetch_reference(channel: discord.TextChannel, message_id: int) -> discord.Message | None:
-    try:
-        return await channel.fetch_message(message_id)
-    except discord.NotFound:
-        return None
-    except discord.HTTPException as exc:
-        logger.warning("Could not fetch referenced message %s: %s", message_id, exc)
-        return None
-
-
-async def build_message(message: discord.Message) -> dict:
-    # Nothing is downloaded: every attachment kind keeps its CDN URL.
-    attachments = [attachment.url for attachment in message.attachments]
-
-    reply_to = None
-    if message.reference and message.reference.message_id:
-        parent = await fetch_reference(message.channel, message.reference.message_id)
-        if parent is not None:
-            reply_to = {
-                "message_id": parent.id,
-                "author_id": parent.author.id,
-                "author_username": str(parent.author),
-                "content_snippet": (parent.content or "")[:200],
-            }
-
-    return {
-        "id": message.id,
-        "timestamp": message.created_at.isoformat(),
-        "author": message.author.global_name or message.author.name,
-        "author_id": message.author.id,
-        "content": message.content or "",
-        "attachments": attachments,
-        "reply_to": reply_to,
-    }
 
 
 async def push_once() -> None:
@@ -121,29 +72,21 @@ async def push_once() -> None:
             logger.info("Nothing new to push")
             return
 
-        published = await archive.publish(batch)
+        published = await publish_batch(archive, batch)
         if not published:
             return
-
         total = sum(len(ids) for ids in published.values())
-        missing = await archive.verify(published)
-        if missing:
-            logger.error(
-                "Batch is not on the branch yet, keeping local buffer: %s",
-                ", ".join(missing[:3]),
-            )
-            return
 
         async with _buffer_lock:
             archive.clear_published(published)
         logger.info("Pushed and verified %d message(s); local buffer cleared", total)
     except ArchiveError as exc:
-        # The expected failure mode -- GitHub being slow, throttling or 5xx --
+        # the expected failure mode -- GitHub being slow, throttling or 5xx --
         # already carries the call, the attempt count and the last error. A
         # traceback here buried the one useful line under twenty of aiohttp's.
         logger.error("Push cycle failed, local buffer left intact: %s", exc)
     except Exception:
-        # A raised error here would end push_loop and silently stop archiving.
+        # a raised error here would end push_loop and silently stop archiving.
         logger.exception("Push cycle failed, local buffer left intact")
 
 
@@ -181,7 +124,7 @@ async def on_message(message: discord.Message) -> None:
     row = message_row(record)
     async with _buffer_lock:
         append_row(channel_path(message.channel), row)
-        record_users(message.guild, [record])
+        merge_user_map(user_map_path(message.guild), [record])
     logger.debug("Buffered message %s from #%s", message.id, message.channel.name)
 
     if bot.user in message.mentions:

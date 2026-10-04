@@ -16,6 +16,10 @@ on:
   push:
     branches: [main]
     paths: ['inbox/**']
+  # for re-running a merge after a failure, and for the batches that landed
+  # before this workflow existed: Actions never fires retroactively, so those
+  # need one manual run to be merged
+  workflow_dispatch:
 
 permissions:
   contents: write
