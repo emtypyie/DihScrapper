@@ -73,8 +73,10 @@ jobs:
       GITHUB_OWNER: ${{ vars.ARCHIVE_OWNER }}
       GITHUB_DATA_REPO: ${{ vars.ARCHIVE_REPO }}
       GITHUB_BRANCH: ${{ vars.ARCHIVE_BRANCH }}
-      # nothing local survives the runner, and it only ever holds unsent rows
-      DATA_ROOT: ${{ runner.temp }}/HOME
+      # Spelled as the runner's own variable rather than ${{ runner.temp }}/HOME:
+      # GitHub rejects an env value that concatenates an expression with literal
+      # text, and it fails the whole file at parse time, not just this line.
+      DATA_ROOT: $RUNNER_TEMP/HOME
     steps:
       - uses: actions/checkout@v4
         with:
