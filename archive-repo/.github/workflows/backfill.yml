@@ -1,17 +1,21 @@
 # Backfill: read a channel's Discord history and append it to the archive.
 #
+# Archive-side, next to the merge it causes: this pushes batches into inbox/, and
+# the muncher in this same repository merges them into the transcripts on main.
+# Both halves of that pipeline belong in the repository whose branch they move.
+#
+# This file is the copy of record. It lives in DihScrapper under archive-repo/ and
+# is installed into the archive repo by archive-repo/sync.ps1, which installs the
+# code it runs too -- backfill.py and the modules beside it. One source, copied,
+# never edited: the logic is developed and reviewed in DihScrapper.
+#
 # Manual only. A backfill is opt-in because it costs the bot's token rate limit,
 # and because "how much history" is a decision, not a default. The live bot keeps
 # archiving throughout -- this only ever adds new files under inbox/, and the
-# muncher in ScrapedDih merges them keyed on message id, so anything the bot
-# already captured is deduplicated rather than duplicated.
+# muncher merges them keyed on message id, so anything the bot already captured
+# is deduplicated rather than duplicated.
 #
-# It belongs here rather than in the archive repo for the same reason the bot
-# lives here: it needs DISCORD_API and GITHUB_TOKEN, and it reads this code. It
-# publishes over the GitHub API with a PAT, so it needs no write permission from
-# this repository -- contents: read is only for the checkout.
-#
-# Maintainer-owned: RULEBOOK rule 2 keeps .github/workflows/ out of contributor PRs.
+# It publishes over the GitHub API, so contents: read is only for the checkout.
 name: backfill
 
 on:

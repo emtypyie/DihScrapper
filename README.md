@@ -83,10 +83,10 @@ only writer of a transcript is this job.
 
 The workflow lives in the **archive** repository, because that is where the push it reacts to
 happens: a workflow only fires for pushes to its own repository. `archive-repo/` is the copy
-of record for that workflow, and `archive-repo/sync.ps1` installs it — along with `muncher.py`
-and `formatter.py` — into a `ScrapedDih` checkout. Those two scripts are copied rather than
-duplicated so the merge logic has one source; `tests/test_muncher.py` is what proves the copy
-is correct.
+of record for that workflow, and `archive-repo/sync.ps1` installs it — along with `muncher.py`,
+`formatter.py`, `capture.py`, `logger.py` and `pusher.py` — into a `ScrapedDih` checkout. Those
+scripts are copied rather than duplicated so the merge logic has one source;
+`tests/test_muncher.py` is what proves the copy is correct.
 
 - **Idempotent.** Merging by key means a re-run or a manual re-trigger changes nothing.
 - **Append-only.** Rows are only ever added, sorted, and rewritten. No archive path is ever
@@ -99,8 +99,14 @@ An empty inbox produces no commit, which is what stops the workflow re-triggerin
 ## Backfilling history
 
 `main.py` archives what arrives after it connects. `backfill.py` reads what came before,
-and it runs only when you ask for it: **Actions → backfill → Run workflow**, or from a
-shell.
+and it runs only when you ask for it: **Actions → backfill → Run workflow** in the archive
+repository, or from a shell.
+
+The backfill workflow is archive-side too, and for the same reason as the muncher: it pushes
+batches into `inbox/`, so the repository whose branch it moves is the one that should run it.
+Its copy of record is `archive-repo/.github/workflows/backfill.yml`, installed by the same
+`sync.ps1` — together with the modules it runs, since the archive repository is what executes
+`backfill.py`.
 
 The bot needs no special permission for this and no user token — a bot with **Read
 Message History** can read a channel's history over the REST API. This is the bot's own
@@ -140,7 +146,8 @@ stop.
 
 ### Running it from Actions
 
-The `backfill` workflow is manual-only (`workflow_dispatch`) and needs, once:
+The `backfill` workflow is manual-only (`workflow_dispatch`) and lives in the **archive**
+repository. Set these once, over there:
 
 | | |
 | --- | --- |
@@ -149,6 +156,10 @@ The `backfill` workflow is manual-only (`workflow_dispatch`) and needs, once:
 | Variable `ARCHIVE_OWNER` | archive repo owner |
 | Variable `ARCHIVE_REPO` | archive repo name, e.g. `ScrapedDih` |
 | Variable `ARCHIVE_BRANCH` | archive branch, default `main` |
+
+Since it runs inside the archive repository, the built-in `GITHUB_TOKEN` would do for
+`ARCHIVE_TOKEN` given `contents: write`; the PAT is what keeps the two consistent with the
+bot's own publishing path.
 
 Inputs: `channel_id` (comma separated, threads welcome), `server_id` (every readable text
 channel), `limit` (0 for all), `resolve_replies`, `delay`, `list_only`. Leave both id boxes

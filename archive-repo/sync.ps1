@@ -1,9 +1,14 @@
-# Copy the archive-side files from DihScrapper into a ScrapedDih checkout.
+# Copy the archive-side files from DihScapper into a ScrapedDih checkout.
 #
-# The archive's workflow cannot live in DihScrapper: it fires on pushes to
-# ScrapedDih/inbox/, and a workflow only sees its own repository's pushes. This
-# copies the workflow, and copies (never edits) muncher.py and formatter.py, so
-# the merge logic keeps exactly one source.
+# The archive's workflows cannot live in DihScrapper: they act on ScrapedDih --
+# the muncher fires on pushes to inbox/, and the backfill pushes to inbox/ at all
+# -- and a workflow only ever sees its own repository. Both halves of that
+# pipeline live in the archive repo, where the branch they move is.
+#
+# This copies the workflows, and copies (never edits) the code they run, so the
+# logic keeps exactly one source. The backfill needs most of the app -- it reads
+# history, stages a batch and publishes it -- so it brings capture, formatter,
+# logger and pusher along with it.
 #
 #   .\archive-repo\sync.ps1 -Check -Target ..\ScrapedDih   # report drift
 #   .\archive-repo\sync.ps1 -Target ..\ScrapedDih           # install
@@ -23,8 +28,15 @@ $target = (Resolve-Path -LiteralPath $Target).Path
 
 $files = @(
     @{ From = Join-Path $PSScriptRoot '.github\workflows\muncher.yml'; To = '.github\workflows\muncher.yml' }
+    @{ From = Join-Path $PSScriptRoot '.github\workflows\backfill.yml'; To = '.github\workflows\backfill.yml' }
     @{ From = Join-Path $root 'muncher.py'; To = 'muncher.py' }
+    @{ From = Join-Path $root 'backfill.py'; To = 'backfill.py' }
+    @{ From = Join-Path $root 'capture.py'; To = 'capture.py' }
     @{ From = Join-Path $root 'formatter.py'; To = 'formatter.py' }
+    @{ From = Join-Path $root 'logger.py'; To = 'logger.py' }
+    @{ From = Join-Path $root 'pusher.py'; To = 'pusher.py' }
+    # the backfill workflow installs from it
+    @{ From = Join-Path $root 'requirements.txt'; To = 'requirements.txt' }
 )
 
 $stale = 0
